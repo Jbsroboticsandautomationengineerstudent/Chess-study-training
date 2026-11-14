@@ -1,6 +1,12 @@
 name: Repo
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - userscript.js
+      - web/**
+      - .github/workflows/repo.yml
   workflow_run:
     workflows: ["Build Chess Assistant"]
     types: [completed]
@@ -60,7 +66,8 @@ jobs:
 
       - name: Landing page
         run: |
-          cp web/index.html site/index.html
+          cp -R web/. site/
+          cp userscript.js site/maia-chess.user.js
           printf '' > site/.nojekyll
 
       - uses: actions/upload-pages-artifact@v3
