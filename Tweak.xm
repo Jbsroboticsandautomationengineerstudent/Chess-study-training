@@ -163,28 +163,12 @@ static double evalToWinPct(double pawns, BOOL isMate, int mateIn) {
     return w;
 }
 
-static NSInteger eloToDepth(NSInteger elo) {
-    if (elo >= 3000) return 20;  if (elo >= 2600) return 18;
-    if (elo >= 2400) return 16;  if (elo >= 2200) return 14;
-    if (elo >= 2000) return 13;  if (elo >= 1800) return 12;
-    if (elo >= 1600) return 11;  if (elo >= 1400) return 10;
-    if (elo >= 1200) return 9;   if (elo >= 1000) return 8;
-    if (elo >= 700)  return 6;   if (elo >= 500) return 5;
-    return 4;
-}
-
 static void showQualityToast(NSString *text, UIColor *color);
 static void ensureMaiaLoaded(void);
 static void fetchMove(NSString *fen);
 static NSString *buildPGN(void);
 static void updateEvalBar(void);
 static void removeEvalBar(void);
-
-static NSString *formatEvalLabel(double evalUs, BOOL isMate, int mateIn) {
-    if (isMate) return [NSString stringWithFormat:@"M%d", abs(mateIn)];
-    if (gShowWinPct) return [NSString stringWithFormat:@"%.0f%%", evalToWinPct(evalUs, NO, 0)];
-    return [NSString stringWithFormat:@"%+.1f", evalUs];
-}
 
 static NSString *qName(int i) {
     switch (i) {
@@ -1000,8 +984,6 @@ static void showSettingsMenu(void) {
 }
 @end
 
-static const NSInteger kEloLevels[] = {400,600,800,1000,1200,1400,1600,1800,2000,2200,2400,2800,3200,3500};
-static const int kEloCount = 14;
 static NSString *ecoName(void) {
     if (!gUciSeq || !gUciSeq.length) return nil;
     static NSDictionary<NSString *, NSString *> *sTable = nil;
