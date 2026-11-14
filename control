@@ -1,0 +1,10 @@
+Package: com.chess.assistant
+Name: Chess Assistant
+Depends: mobilesubstrate
+Version: 2.5.2
+Architecture: iphoneos-arm64
+Description: On-device chess move assistant using Maia 3 only.
+             Human-like move suggestions and probability-labeled arrows on the board.
+Maintainer: epic
+Author: epic
+Section: Tweaks
