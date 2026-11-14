@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Maia 3 Chess Board Assistant
 // @namespace    https://github.com/Jbsroboticsandautomationengineerstudent/Chess-study-training
-// @version      0.1.0
+// @version      0.2.0
 // @description  Local Maia ONNX move probabilities on Chess.com boards
 // @match        https://www.chess.com/play/*
 // @match        https://www.chess.com/analysis*
@@ -14,11 +14,12 @@
 // ==/UserScript==
 
 /*
- * Model contract (the model at MODEL_URL is not included in this repository):
+ * Model contract (the model is published from web/models/maia3_5m.onnx):
  *   tokens      float32 [1,64,96]
  *   self_elo    int32 or int64 [1]
  *   oppo_elo    int32 or int64 [1]
  *   logits_move float32 [1,4352] (move_logits is also accepted)
+ *   logits_value float32 [1,3] (loss, draw, win for the side to move)
  * The token and move-index mappings mirror maia.mm. A stock Maia .pt checkpoint
  * or CoreML .mlpackage cannot be renamed to .onnx; export a compatible model.
  */
@@ -36,7 +37,7 @@
   }
 
   const savedElo = Number(localStorage.getItem('maia-web-elo'));
-  let elo = [1100, 1500, 1900].includes(savedElo) ? savedElo : 1500;
+  let elo = [1100, 1300, 1500, 1700, 1900, 2100, 2300].includes(savedElo) ? savedElo : 1500;
   let board = null;
   let game = null;
   let session = null;
@@ -49,6 +50,8 @@
   let inferenceId = 0;
   let scanTimer = 0;
   let flipOverride = false;
+  let shownMoves = [];
+  const seenPositions = new Map();
 
   const style = document.createElement('style');
   style.textContent = `
@@ -68,6 +71,11 @@
     #maia-web-status{color:#c6d5e4;min-height:32px;margin:5px 0;white-space:pre-wrap}
     #maia-web-moves{margin:6px 0 8px;padding-left:21px;font:14px/1.6 ui-monospace,monospace}
     #maia-web-fen{overflow-wrap:anywhere;color:#a9b9c9;font:10px/1.3 ui-monospace,monospace}
+    #maia-web-value{margin:7px 0 9px}
+    #maia-web-value-label{display:flex;justify-content:space-between;margin-bottom:3px;color:#dbe7f1;font-size:11px}
+    #maia-web-value-bar{display:flex;height:12px;overflow:hidden;border:1px solid #708296;border-radius:5px;background:#33485d}
+    #maia-web-value-bar span{height:100%;min-width:0}
+    #maia-web-white{background:#f5f5ed} #maia-web-draw{background:#cfb951} #maia-web-black{background:#242b35}
     #maia-web-arrow{position:fixed;z-index:2147483645;pointer-events:none;overflow:visible}
     @media(max-width:600px){#maia-web-panel{top:68px;right:8px}}
   `;
@@ -79,10 +87,12 @@
     <div id="maia-web-head"><span>Maia 3</span><span>drag</span></div>
     <div class="body">
       <div class="row"><label for="maia-web-elo">ELO</label>
-        <select id="maia-web-elo"><option>1100</option><option>1500</option><option>1900</option></select>
+        <select id="maia-web-elo"><option>1100</option><option>1300</option><option>1500</option><option>1700</option><option>1900</option><option>2100</option><option>2300</option></select>
         <button id="maia-web-flip" title="Reverse arrow orientation">Flip</button></div>
       <div id="maia-web-status">Finding board…</div>
       <ol id="maia-web-moves"></ol>
+      <div id="maia-web-value"><div id="maia-web-value-label"><span>White win —</span><span>Draw —</span><span>Black win —</span></div>
+        <div id="maia-web-value-bar" role="img" aria-label="Win probabilities"><span id="maia-web-white"></span><span id="maia-web-draw"></span><span id="maia-web-black"></span></div></div>
       <div class="row"><button id="maia-web-retry">Load model</button>
         <button id="maia-web-rescan">Rescan board</button></div>
       <div class="row"><input id="maia-web-paste" placeholder="Paste full FEN if joining midgame" aria-label="Full FEN"></div>
@@ -94,15 +104,16 @@
   const movesEl = panel.querySelector('#maia-web-moves');
   const fenEl = panel.querySelector('#maia-web-fen');
   const eloEl = panel.querySelector('#maia-web-elo');
+  const valueLabels = panel.querySelectorAll('#maia-web-value-label span');
+  const valueSegments = ['#maia-web-white', '#maia-web-draw', '#maia-web-black'].map(selector => panel.querySelector(selector));
   eloEl.value = String(elo);
 
   const arrow = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
   arrow.id = 'maia-web-arrow';
   arrow.setAttribute('viewBox', '0 0 100 100');
-  arrow.innerHTML = '<defs><marker id="maia-web-tip" markerWidth="5" markerHeight="5" refX="4" refY="2.5" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L5,2.5 L0,5 Z" fill="#26d68a"/></marker></defs><line id="maia-web-line" stroke="#26d68a" stroke-width="1.8" stroke-linecap="round" opacity=".82" marker-end="url(#maia-web-tip)"/>';
   document.documentElement.appendChild(arrow);
   arrow.style.display = 'none';
-  const line = arrow.querySelector('#maia-web-line');
+  const svgNS = 'http://www.w3.org/2000/svg';
 
   function setStatus(message) {
     if (statusEl.textContent !== message) statusEl.textContent = message;
@@ -111,6 +122,10 @@
     inferenceId++;
     lastFen = '';
     movesEl.replaceChildren();
+    shownMoves = [];
+    valueLabels.forEach((label, index) => { label.textContent = `${['White win', 'Draw', 'Black win'][index]} —`; });
+    valueSegments.forEach(segment => { segment.style.width = '0%'; });
+    arrow.replaceChildren();
     arrow.style.display = 'none';
   }
   function keepArrowAligned() {
@@ -133,12 +148,47 @@
     return {x: (black ? 7 - file : file) * 12.5 + 6.25,
             y: (black ? rank : 7 - rank) * 12.5 + 6.25};
   }
-  function drawArrow(uci) {
-    if (!board || !uci) { arrow.style.display = 'none'; return; }
-    const a = squarePoint(uci.slice(0, 2));
-    const b = squarePoint(uci.slice(2, 4));
-    line.setAttribute('x1', a.x); line.setAttribute('y1', a.y);
-    line.setAttribute('x2', b.x); line.setAttribute('y2', b.y);
+  function drawArrows(moves = shownMoves) {
+    arrow.replaceChildren();
+    if (!board || !moves.length) { arrow.style.display = 'none'; return; }
+    const colors = ['#24dc83', '#71e5a8', '#b8efd1'];
+    const opacities = [1, 0.78, 0.58];
+    const destinationCounts = new Map();
+    for (const move of moves) destinationCounts.set(move.uci.slice(2, 4), (destinationCounts.get(move.uci.slice(2, 4)) || 0) + 1);
+    const destinationSlots = new Map();
+    moves.forEach((move, index) => {
+      const a = squarePoint(move.uci.slice(0, 2));
+      const b = squarePoint(move.uci.slice(2, 4));
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const length = Math.hypot(dx, dy);
+      if (!length) return;
+      const ux = dx / length, uy = dy / length;
+      const endX = b.x - ux * 3.2, endY = b.y - uy * 3.2;
+      const line = document.createElementNS(svgNS, 'line');
+      for (const [name, value] of Object.entries({x1: a.x, y1: a.y, x2: endX, y2: endY, stroke: colors[index], 'stroke-width': 1.6 - index * 0.2, 'stroke-linecap': 'round', opacity: opacities[index]})) line.setAttribute(name, value);
+      arrow.appendChild(line);
+      const tip = document.createElementNS(svgNS, 'polygon');
+      const wingX = -uy * 2.1, wingY = ux * 2.1;
+      tip.setAttribute('points', `${b.x},${b.y} ${b.x - ux * 4.3 + wingX},${b.y - uy * 4.3 + wingY} ${b.x - ux * 4.3 - wingX},${b.y - uy * 4.3 - wingY}`);
+      tip.setAttribute('fill', colors[index]); tip.setAttribute('opacity', opacities[index]);
+      arrow.appendChild(tip);
+      const dest = move.uci.slice(2, 4);
+      const slot = destinationSlots.get(dest) || 0;
+      destinationSlots.set(dest, slot + 1);
+      const label = document.createElementNS(svgNS, 'text');
+      label.setAttribute('x', b.x);
+      label.setAttribute('y', b.y + 4.3 - (destinationCounts.get(dest) - 1 - slot) * 3.2);
+      label.setAttribute('text-anchor', 'middle');
+      label.setAttribute('font-size', '2.8');
+      label.setAttribute('font-weight', '700');
+      label.setAttribute('font-family', 'system-ui,sans-serif');
+      label.setAttribute('fill', colors[index]);
+      label.setAttribute('stroke', '#10251b');
+      label.setAttribute('stroke-width', '0.8');
+      label.setAttribute('paint-order', 'stroke');
+      label.textContent = `${move.percent.toFixed(1)}%`;
+      arrow.appendChild(label);
+    });
     arrow.style.display = 'block';
     keepArrowAligned();
   }
@@ -173,7 +223,7 @@
   }
   function findBoard() {
     let best = null, bestArea = 0;
-    for (const el of document.querySelectorAll('wc-chess-board, chess-board, #board-single, .board, [data-cy="board"]')) {
+    for (const el of document.querySelectorAll('wc-chess-board, chess-board, #board-single, #board-analysis, .board, [data-cy="board"]')) {
       const r = el.getBoundingClientRect();
       if (r.width < 160 || r.height < 160 || !piecesFrom(el)) continue;
       const area = r.width * r.height;
@@ -212,17 +262,33 @@
     }
     return matches.length === 1 ? matches[0] : null;
   }
+  function rememberPosition(position) {
+    const placement = position.fen().split(' ')[0];
+    const positions = seenPositions.get(placement) || new Set();
+    positions.add(position.fen());
+    seenPositions.set(placement, positions);
+  }
+  function seenGame(placement) {
+    const positions = seenPositions.get(placement);
+    return positions?.size === 1 ? tryLoadFen([...positions][0], placement) : null;
+  }
 
   function scan() {
     const found = findBoard();
-    if (found !== board) { board = found; game = null; lastBoard = ''; clearPrediction(); }
-    if (!board) { setStatus('Chess.com board not found.'); fenEl.textContent = ''; return; }
+    if (found !== board) {
+      board = found;
+      if (board && shownMoves.length) drawArrows();
+      else arrow.style.display = 'none';
+    }
+    if (!board) { setStatus('Waiting for Chess.com board…'); return; }
     const placement = piecesFrom(board);
     if (!placement) { setStatus('Waiting for pieces…'); return; }
-    if (placement !== lastBoard) {
-      let next = siteFen(placement);
+    const fromSite = siteFen(placement);
+    if (placement !== lastBoard || !game || (fromSite && fromSite.fen() !== game.fen())) {
+      let next = fromSite;
       if (!next && game && game.fen().split(' ')[0] === placement) next = game;
       if (!next) next = nextGame(placement);
+      if (!next) next = seenGame(placement);
       if (!next) {
         const start = new ChessClass();
         if (start.fen().split(' ')[0] === placement) next = start;
@@ -238,6 +304,7 @@
       }
       missedCount = 0;
       game = next; lastBoard = placement; clearPrediction();
+      rememberPosition(game);
     }
     if (!game) return;
     const fen = game.fen();
@@ -331,6 +398,21 @@
       return new ortApi.Tensor('int32', Int32Array.of(elo), [1]);
     throw new Error(`${name} must be int32 or int64, got ${type}`);
   }
+  function showValue(logits, blackToMove) {
+    if (!logits || logits.length !== 3 || !Array.from(logits).every(Number.isFinite)) {
+      valueLabels.forEach((label, index) => { label.textContent = `${['White win', 'Draw', 'Black win'][index]} —`; });
+      valueSegments.forEach(segment => { segment.style.width = '0%'; });
+      return;
+    }
+    const max = Math.max(...logits);
+    const weights = Array.from(logits, value => Math.exp(value - max));
+    const total = weights.reduce((a, b) => a + b, 0);
+    const [loss, draw, win] = weights.map(value => 100 * value / total);
+    const percentages = blackToMove ? [loss, draw, win] : [win, draw, loss];
+    valueLabels.forEach((label, index) => { label.textContent = `${['White win', 'Draw', 'Black win'][index]} ${percentages[index].toFixed(1)}%`; });
+    valueSegments.forEach((segment, index) => { segment.style.width = `${percentages[index]}%`; });
+    panel.querySelector('#maia-web-value-bar').setAttribute('aria-label', `White win ${percentages[0].toFixed(1)}%, draw ${percentages[1].toFixed(1)}%, black win ${percentages[2].toFixed(1)}%`);
+  }
   async function predict(fen) {
     if (!session || !game || fen === lastFen) return;
     lastFen = fen;
@@ -356,13 +438,15 @@
       const max = Math.max(...candidates.map(x => x.logit));
       const sum = candidates.reduce((acc, x) => acc + Math.exp(x.logit - max), 0);
       candidates.sort((a, b) => b.logit - a.logit);
+      shownMoves = candidates.slice(0, 3).map(candidate => ({uci: candidate.uci, percent: 100 * Math.exp(candidate.logit - max) / sum}));
       movesEl.replaceChildren();
-      for (const candidate of candidates.slice(0, 3)) {
+      for (const candidate of shownMoves) {
         const li = document.createElement('li');
-        li.textContent = `${candidate.uci} (${(100 * Math.exp(candidate.logit - max) / sum).toFixed(1)}%)`;
+        li.textContent = `${candidate.uci} (${candidate.percent.toFixed(1)}%)`;
         movesEl.appendChild(li);
       }
-      drawArrow(candidates[0].uci);
+      drawArrows();
+      showValue(output.logits_value?.data, black);
       setStatus(`Maia ${elo} · ${black ? 'Black' : 'White'} to move`);
     } catch (error) {
       if (myId !== inferenceId) return;
@@ -384,7 +468,7 @@
   });
   panel.querySelector('#maia-web-flip').addEventListener('click', () => {
     flipOverride = !flipOverride;
-    if (movesEl.firstElementChild) drawArrow(movesEl.firstElementChild.textContent.slice(0, 4));
+    drawArrows();
   });
   panel.querySelector('#maia-web-use-fen').addEventListener('click', () => {
     if (!board) { setStatus('Open a Chess.com board first.'); return; }
@@ -416,12 +500,15 @@
       return el && !el.closest('#maia-web-panel, #maia-web-arrow');
     })) scheduleScan();
   }).observe(document.documentElement, {
-    subtree: true, childList: true, attributes: true,
-    attributeFilter: ['class', 'data-fen']
+    subtree: true, childList: true, characterData: true, attributes: true,
+    attributeFilter: ['class', 'style', 'data-fen', 'data-orientation', 'aria-hidden']
   });
   addEventListener('resize', keepArrowAligned);
   addEventListener('scroll', keepArrowAligned, true);
-  setInterval(scan, 1500);
+  addEventListener('pageshow', scheduleScan);
+  addEventListener('popstate', scheduleScan);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) scheduleScan(); });
+  setInterval(scan, 1000);
   scan();
   void loadModel();
 })();
