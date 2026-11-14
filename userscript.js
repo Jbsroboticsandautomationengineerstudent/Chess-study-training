@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Maia 3 Chess Board Assistant
 // @namespace    https://github.com/Jbsroboticsandautomationengineerstudent/Chess-study-training
-// @version      0.2.0
+// @version      0.3.0
 // @description  Local Maia ONNX move probabilities on Chess.com boards
-// @match        https://www.chess.com/play/*
-// @match        https://www.chess.com/analysis*
+// @match        https://www.chess.com/*
+// @match        https://chess.com/*
 // @run-at       document-idle
 // @inject-into  content
 // @require      https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js
@@ -37,7 +37,8 @@
   }
 
   const savedElo = Number(localStorage.getItem('maia-web-elo'));
-  let elo = [1100, 1300, 1500, 1700, 1900, 2100, 2300].includes(savedElo) ? savedElo : 1500;
+  const eloOptions = [500, 600, 700, 800, 900, 1000, 1100, 1300, 1500, 1700, 1900, 2100, 2300];
+  let elo = eloOptions.includes(savedElo) ? savedElo : 1500;
   let board = null;
   let game = null;
   let session = null;
@@ -87,7 +88,7 @@
     <div id="maia-web-head"><span>Maia 3</span><span>drag</span></div>
     <div class="body">
       <div class="row"><label for="maia-web-elo">ELO</label>
-        <select id="maia-web-elo"><option>1100</option><option>1300</option><option>1500</option><option>1700</option><option>1900</option><option>2100</option><option>2300</option></select>
+        <select id="maia-web-elo"></select>
         <button id="maia-web-flip" title="Reverse arrow orientation">Flip</button></div>
       <div id="maia-web-status">Finding board…</div>
       <ol id="maia-web-moves"></ol>
@@ -106,6 +107,7 @@
   const eloEl = panel.querySelector('#maia-web-elo');
   const valueLabels = panel.querySelectorAll('#maia-web-value-label span');
   const valueSegments = ['#maia-web-white', '#maia-web-draw', '#maia-web-black'].map(selector => panel.querySelector(selector));
+  for (const rating of eloOptions) eloEl.add(new Option(String(rating), String(rating)));
   eloEl.value = String(elo);
 
   const arrow = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
@@ -201,7 +203,11 @@
       const piece = classes.find(c => /^[wb][prnbqk]$/.test(c));
       const square = classes.map(c => /^square-([1-8])([1-8])$/.exec(c)).find(Boolean);
       if (!piece || !square) continue;
-      if (pieces.has(`${square[1]}${square[2]}`)) return null;
+      if (pieces.has(`${square[1]}${square[2]}`)) {
+        // Chess.com may briefly duplicate a piece while animating a move.
+        if (pieces.get(`${square[1]}${square[2]}`) !== piece) return null;
+        continue;
+      }
       pieces.set(`${square[1]}${square[2]}`, piece);
     }
     if (!pieces.size || pieces.size > 32) return null;
@@ -222,12 +228,24 @@
     return placement;
   }
   function findBoard() {
-    let best = null, bestArea = 0;
-    for (const el of document.querySelectorAll('wc-chess-board, chess-board, #board-single, #board-analysis, .board, [data-cy="board"]')) {
+    let best = null, bestScore = 0;
+    for (const el of document.querySelectorAll('wc-chess-board, chess-board, #board-single, #board-analysis, #game-board, #board, .board, .chess-board, .board-layout-chessboard, [data-cy="board"], [data-test-element="board"], [class*="chessboard"]')) {
       const r = el.getBoundingClientRect();
-      if (r.width < 160 || r.height < 160 || !piecesFrom(el)) continue;
+      if (r.width < 160 || r.height < 160 || r.width / r.height < 0.85 || r.width / r.height > 1.15) continue;
+      if (r.bottom < 0 || r.right < 0 || r.top > innerHeight || r.left > innerWidth) continue;
       const area = r.width * r.height;
-      if (area > bestArea) { best = el; bestArea = area; }
+      const tag = el.tagName.toLowerCase();
+      const score = area * (tag === 'wc-chess-board' || tag === 'chess-board' ? 1.2 : 1) * (el.querySelector('.piece') ? 1.2 : 1);
+      if (score > bestScore) { best = el; bestScore = score; }
+    }
+    if (!best) {
+      const piece = document.querySelector('.piece');
+      for (let el = piece?.parentElement; el && el !== document.body; el = el.parentElement) {
+        const r = el.getBoundingClientRect();
+        if (r.width >= 160 && r.height >= 160 && r.width / r.height >= 0.85 && r.width / r.height <= 1.15 &&
+            r.bottom >= 0 && r.right >= 0 && r.top <= innerHeight && r.left <= innerWidth &&
+            el.querySelectorAll('.piece').length >= 2) { best = el; break; }
+      }
     }
     return best;
   }
@@ -236,8 +254,23 @@
     const candidate = new ChessClass();
     try {
       if (!candidate.load(fen.trim())) return null;
-      return candidate.fen().split(' ')[0] === placement ? candidate : null;
+      return !placement || candidate.fen().split(' ')[0] === placement ? candidate : null;
     } catch { return null; }
+  }
+  function boardFen(boardElement) {
+    for (const el of [boardElement, boardElement.querySelector('wc-chess-board, chess-board')].filter(Boolean)) {
+      let fen;
+      try {
+        if (typeof el.game?.getFEN === 'function') fen = el.game.getFEN();
+        else if (typeof el.game?.fen === 'function') fen = el.game.fen();
+        else if (typeof el.game?.fen === 'string') fen = el.game.fen;
+      }
+      catch { /* Some board versions do not expose a game object. */ }
+      fen ||= el.getAttribute('data-fen');
+      const loaded = tryLoadFen(fen);
+      if (loaded) return loaded;
+    }
+    return null;
   }
   function siteFen(placement) {
     const selectors = ['[data-fen]', 'input[aria-label*="FEN"]', 'input[placeholder*="FEN"]'];
@@ -280,10 +313,11 @@
       if (board && shownMoves.length) drawArrows();
       else arrow.style.display = 'none';
     }
-    if (!board) { setStatus('Waiting for Chess.com board…'); return; }
-    const placement = piecesFrom(board);
-    if (!placement) { setStatus('Waiting for pieces…'); return; }
-    const fromSite = siteFen(placement);
+    if (!board) { setStatus('Scanning Chess.com for a board…'); return; }
+    const directFen = boardFen(board);
+    const placement = piecesFrom(board) || directFen?.fen().split(' ')[0];
+    if (!placement) { setStatus('Board found. Waiting for position data…'); return; }
+    const fromSite = (directFen?.fen().split(' ')[0] === placement ? directFen : null) || siteFen(placement);
     if (placement !== lastBoard || !game || (fromSite && fromSite.fen() !== game.fen())) {
       let next = fromSite;
       if (!next && game && game.fen().split(' ')[0] === placement) next = game;
@@ -315,7 +349,7 @@
   }
   function scheduleScan() {
     clearTimeout(scanTimer);
-    scanTimer = setTimeout(scan, 250);
+    scanTimer = setTimeout(scan, 60);
   }
 
   function downloadModel(url) {
@@ -508,7 +542,7 @@
   addEventListener('pageshow', scheduleScan);
   addEventListener('popstate', scheduleScan);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) scheduleScan(); });
-  setInterval(scan, 1000);
+  setInterval(scan, 300);
   scan();
   void loadModel();
 })();
