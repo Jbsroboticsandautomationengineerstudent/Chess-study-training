@@ -12,7 +12,7 @@ On-device chess move assistant for the Chess.com iOS app. Maia 3 CoreML inferenc
 
 ## Install
 
-For a rootless jailbreak, add `https://itzzace.github.io/chess-assistant/` to Sileo or Zebra, install the package, and respring. See the [releases page](https://github.com/itzzace/chess-assistant/releases) for other distributions.
+For a rootless jailbreak, add `https://jbsroboticsandautomationengineerstudent.github.io/Chess-study-training/` to Sileo or Zebra, install the package, and respring. See the [releases page](https://github.com/Jbsroboticsandautomationengineerstudent/Chess-study-training/releases) for other distributions.
 
 ## Build
 

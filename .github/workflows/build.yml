@@ -49,6 +49,6 @@ jobs:
           gh release delete latest --yes --cleanup-tag || true
           gh release create latest "$DEB" \
             --title "Chess Assistant (rolling build)" \
-            --notes "Rolling dev build. Use the v2.5.2 release for the stable download." \
+            --notes "Rolling Maia 3 only build." \
             --prerelease
           gh release upload v2.5.2 "$DEB" --clobber || true
