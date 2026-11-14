@@ -40,6 +40,13 @@ jobs:
         env:
           THEOS: ${{ github.workspace }}/theos
 
+      - name: Upload .deb to Actions artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: chess-assistant-deb
+          path: packages/*.deb
+          if-no-files-found: error
+
       - name: Publish .deb as release
         env:
           GH_TOKEN: ${{ github.token }}
