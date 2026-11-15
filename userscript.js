@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Maia 3 Chess Board Assistant
 // @namespace    https://github.com/Jbsroboticsandautomationengineerstudent/Chess-study-training
-// @version      0.3.0
+// @version      0.4.0
 // @description  Local Maia ONNX move probabilities on Chess.com boards
 // @match        https://www.chess.com/*
 // @match        https://chess.com/*
@@ -52,6 +52,12 @@
   let scanTimer = 0;
   let flipOverride = false;
   let shownMoves = [];
+  let shownValue = null;
+  let shownLogitsValue = null;
+  let streamerMode = false;
+  let streamPopup = null;
+  let streamChannel = null;
+  let popupChannel = null;
   const seenPositions = new Map();
 
   const style = document.createElement('style');
@@ -96,6 +102,7 @@
         <div id="maia-web-value-bar" role="img" aria-label="Win probabilities"><span id="maia-web-white"></span><span id="maia-web-draw"></span><span id="maia-web-black"></span></div></div>
       <div class="row"><button id="maia-web-retry">Load model</button>
         <button id="maia-web-rescan">Rescan board</button></div>
+      <div class="row"><button id="maia-web-streamer">Streamer Mode: OFF</button></div>
       <div class="row"><input id="maia-web-paste" placeholder="Paste full FEN if joining midgame" aria-label="Full FEN"></div>
       <div class="row"><button id="maia-web-use-fen">Use FEN</button></div>
       <div id="maia-web-fen"></div>
@@ -118,20 +125,26 @@
   const svgNS = 'http://www.w3.org/2000/svg';
 
   function setStatus(message) {
-    if (statusEl.textContent !== message) statusEl.textContent = message;
+    if (statusEl.textContent !== message) {
+      statusEl.textContent = message;
+      publishStreamState();
+    }
   }
   function clearPrediction() {
     inferenceId++;
     lastFen = '';
     movesEl.replaceChildren();
     shownMoves = [];
+    shownValue = null;
+    shownLogitsValue = null;
     valueLabels.forEach((label, index) => { label.textContent = `${['White win', 'Draw', 'Black win'][index]} —`; });
     valueSegments.forEach(segment => { segment.style.width = '0%'; });
     arrow.replaceChildren();
     arrow.style.display = 'none';
+    publishStreamState();
   }
   function keepArrowAligned() {
-    if (!board || arrow.style.display === 'none') return;
+    if (streamerMode || !board || arrow.style.display === 'none') return;
     const r = board.getBoundingClientRect();
     arrow.style.left = `${r.left}px`;
     arrow.style.top = `${r.top}px`;
@@ -151,6 +164,11 @@
             y: (black ? rank : 7 - rank) * 12.5 + 6.25};
   }
   function drawArrows(moves = shownMoves) {
+    if (streamerMode) {
+      arrow.replaceChildren();
+      arrow.style.display = 'none';
+      return;
+    }
     arrow.replaceChildren();
     if (!board || !moves.length) { arrow.style.display = 'none'; return; }
     const colors = ['#24dc83', '#71e5a8', '#b8efd1'];
@@ -433,7 +451,9 @@
     throw new Error(`${name} must be int32 or int64, got ${type}`);
   }
   function showValue(logits, blackToMove) {
+    shownLogitsValue = logits ? Array.from(logits) : null;
     if (!logits || logits.length !== 3 || !Array.from(logits).every(Number.isFinite)) {
+      shownValue = null;
       valueLabels.forEach((label, index) => { label.textContent = `${['White win', 'Draw', 'Black win'][index]} —`; });
       valueSegments.forEach(segment => { segment.style.width = '0%'; });
       return;
@@ -443,9 +463,109 @@
     const total = weights.reduce((a, b) => a + b, 0);
     const [loss, draw, win] = weights.map(value => 100 * value / total);
     const percentages = blackToMove ? [loss, draw, win] : [win, draw, loss];
+    shownValue = percentages;
     valueLabels.forEach((label, index) => { label.textContent = `${['White win', 'Draw', 'Black win'][index]} ${percentages[index].toFixed(1)}%`; });
     valueSegments.forEach((segment, index) => { segment.style.width = `${percentages[index]}%`; });
     panel.querySelector('#maia-web-value-bar').setAttribute('aria-label', `White win ${percentages[0].toFixed(1)}%, draw ${percentages[1].toFixed(1)}%, black win ${percentages[2].toFixed(1)}%`);
+  }
+  function publishStreamState() {
+    if (!streamerMode || !streamChannel) return;
+    streamChannel.postMessage({type: 'state', elo, status: statusEl.textContent,
+      moves: shownMoves.map(move => ({uci: move.uci, percent: move.percent})),
+      logits_value: shownLogitsValue, value: shownValue ? [...shownValue] : null});
+  }
+  function stopStreamerMode() {
+    if (!streamerMode) return;
+    streamerMode = false;
+    try { streamChannel?.close(); popupChannel?.close(); }
+    catch { /* The popup may already be closed. */ }
+    streamChannel = popupChannel = null;
+    if (streamPopup && !streamPopup.closed) streamPopup.close();
+    streamPopup = null;
+    panel.style.display = '';
+    panel.querySelector('#maia-web-streamer').textContent = 'Streamer Mode: OFF';
+    if (!arrow.isConnected) document.documentElement.appendChild(arrow);
+    drawArrows();
+  }
+  function startStreamerMode() {
+    if (streamerMode) return;
+    if (typeof BroadcastChannel !== 'function') {
+      setStatus('This browser does not support BroadcastChannel.');
+      return;
+    }
+    const popup = window.open('', `maia-streamer-${Date.now()}`, 'popup,width=320,height=500');
+    if (!popup) { setStatus('Allow popups for Chess.com, then try Streamer Mode again.'); return; }
+    try {
+      popup.document.open();
+      popup.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>Maia 3 Streamer View</title>
+        <style>body{margin:0;background:#121c28;color:#f6f8fb;font:14px/1.5 system-ui,-apple-system,sans-serif}
+        main{padding:16px}h1{margin:0 0 14px;font-size:18px}.row{display:flex;align-items:center;gap:8px;margin:10px 0}
+        select,button{background:#33485d;color:#fff;border:1px solid #708296;border-radius:6px;padding:7px;font:inherit}
+        select{flex:1}button{cursor:pointer}#status{color:#c6d5e4;min-height:40px;margin:12px 0}
+        ol{padding-left:24px;font:16px/1.8 ui-monospace,monospace;min-height:88px}
+        #labels{display:flex;justify-content:space-between;font-size:11px;gap:4px}
+        #bar{display:flex;height:16px;border:1px solid #708296;border-radius:6px;overflow:hidden;background:#33485d}
+        #bar span{min-width:0;height:100%}#white{background:#f5f5ed}#draw{background:#cfb951}#black{background:#242b35}
+        </style></head><body><main><h1>Maia 3</h1><div class="row"><label for="elo">ELO</label><select id="elo"></select></div>
+        <div id="status">Connecting…</div><ol id="moves"></ol><div id="labels"><span>White win —</span><span>Draw —</span><span>Black win —</span></div>
+        <div id="bar"><span id="white"></span><span id="draw"></span><span id="black"></span></div>
+        <div class="row"><button id="off">Streamer Mode: ON · Turn off</button></div></main></body></html>`);
+      popup.document.close();
+      const popupElo = popup.document.getElementById('elo');
+      for (const rating of eloOptions) {
+        const option = popup.document.createElement('option');
+        option.value = option.textContent = String(rating);
+        popupElo.appendChild(option);
+      }
+      const channelName = `maia-streamer-${crypto.randomUUID?.() || Date.now()}`;
+      streamChannel = new BroadcastChannel(channelName);
+      popupChannel = new popup.BroadcastChannel(channelName);
+      streamChannel.onmessage = event => {
+        if (event.data?.type === 'off') stopStreamerMode();
+        if (event.data?.type === 'elo' && eloOptions.includes(event.data.elo)) {
+          eloEl.value = String(event.data.elo);
+          eloEl.dispatchEvent(new Event('change'));
+        }
+      };
+      popupChannel.onmessage = event => {
+        if (event.data?.type !== 'state' || popup.closed) return;
+        const state = event.data;
+        popupElo.value = String(state.elo);
+        popup.document.getElementById('status').textContent = state.status;
+        const list = popup.document.getElementById('moves');
+        list.replaceChildren();
+        for (const move of state.moves) {
+          const item = popup.document.createElement('li');
+          item.textContent = `${move.uci} (${move.percent.toFixed(1)}%)`;
+          list.appendChild(item);
+        }
+        const labels = popup.document.querySelectorAll('#labels span');
+        const segments = ['white', 'draw', 'black'].map(id => popup.document.getElementById(id));
+        labels.forEach((label, index) => {
+          label.textContent = `${['White win', 'Draw', 'Black win'][index]} ${state.value ? `${state.value[index].toFixed(1)}%` : '—'}`;
+          segments[index].style.width = state.value ? `${state.value[index]}%` : '0%';
+        });
+      };
+      popupElo.addEventListener('change', () => popupChannel.postMessage({type: 'elo', elo: Number(popupElo.value)}));
+      popup.document.getElementById('off').addEventListener('click', () => popupChannel.postMessage({type: 'off'}));
+      streamPopup = popup;
+      streamerMode = true;
+      arrow.replaceChildren();
+      arrow.style.display = 'none';
+      arrow.remove();
+      panel.querySelector('#maia-web-streamer').textContent = 'Streamer Mode: ON';
+      panel.style.display = 'none';
+      publishStreamState();
+      popup.focus();
+    } catch (error) {
+      if (streamerMode) stopStreamerMode();
+      else {
+        try { streamChannel?.close(); popupChannel?.close(); popup.close(); }
+        catch { /* Keep the main panel usable if popup setup fails. */ }
+        streamChannel = popupChannel = null;
+      }
+      setStatus(`Streamer Mode failed: ${error.message}`);
+    }
   }
   async function predict(fen) {
     if (!session || !game || fen === lastFen) return;
@@ -504,6 +624,10 @@
     flipOverride = !flipOverride;
     drawArrows();
   });
+  panel.querySelector('#maia-web-streamer').addEventListener('click', () => {
+    if (streamerMode) stopStreamerMode();
+    else startStreamerMode();
+  });
   panel.querySelector('#maia-web-use-fen').addEventListener('click', () => {
     if (!board) { setStatus('Open a Chess.com board first.'); return; }
     const placement = piecesFrom(board);
@@ -542,6 +666,8 @@
   addEventListener('pageshow', scheduleScan);
   addEventListener('popstate', scheduleScan);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) scheduleScan(); });
+  addEventListener('pagehide', stopStreamerMode);
+  setInterval(() => { if (streamerMode && streamPopup?.closed) stopStreamerMode(); }, 500);
   setInterval(scan, 300);
   scan();
   void loadModel();
