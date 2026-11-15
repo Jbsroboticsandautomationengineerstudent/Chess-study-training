@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Maia 3 Chess Board Assistant
 // @namespace    https://github.com/Jbsroboticsandautomationengineerstudent/Chess-study-training
-// @version      0.4.0
+// @version      0.5.0
 // @description  Local Maia ONNX move probabilities on Chess.com boards
 // @match        https://www.chess.com/*
 // @match        https://chess.com/*
@@ -36,9 +36,8 @@
     return;
   }
 
-  const savedElo = Number(localStorage.getItem('maia-web-elo'));
-  const eloOptions = [500, 600, 700, 800, 900, 1000, 1100, 1300, 1500, 1700, 1900, 2100, 2300];
-  let elo = eloOptions.includes(savedElo) ? savedElo : 1500;
+  const eloOptions = [500, 600, 700, 800, 900, 1000, 1100, 1300, 1500, 1700, 1900, 2100, 2300, 2500, 2600, 2700];
+  let elo = 2700;
   let board = null;
   let game = null;
   let session = null;
@@ -170,45 +169,36 @@
       return;
     }
     arrow.replaceChildren();
-    if (!board || !moves.length) { arrow.style.display = 'none'; return; }
-    const colors = ['#24dc83', '#71e5a8', '#b8efd1'];
-    const opacities = [1, 0.78, 0.58];
-    const destinationCounts = new Map();
-    for (const move of moves) destinationCounts.set(move.uci.slice(2, 4), (destinationCounts.get(move.uci.slice(2, 4)) || 0) + 1);
-    const destinationSlots = new Map();
-    moves.forEach((move, index) => {
-      const a = squarePoint(move.uci.slice(0, 2));
-      const b = squarePoint(move.uci.slice(2, 4));
-      const dx = b.x - a.x, dy = b.y - a.y;
-      const length = Math.hypot(dx, dy);
-      if (!length) return;
-      const ux = dx / length, uy = dy / length;
-      const endX = b.x - ux * 3.2, endY = b.y - uy * 3.2;
-      const line = document.createElementNS(svgNS, 'line');
-      for (const [name, value] of Object.entries({x1: a.x, y1: a.y, x2: endX, y2: endY, stroke: colors[index], 'stroke-width': 1.6 - index * 0.2, 'stroke-linecap': 'round', opacity: opacities[index]})) line.setAttribute(name, value);
-      arrow.appendChild(line);
-      const tip = document.createElementNS(svgNS, 'polygon');
-      const wingX = -uy * 2.1, wingY = ux * 2.1;
-      tip.setAttribute('points', `${b.x},${b.y} ${b.x - ux * 4.3 + wingX},${b.y - uy * 4.3 + wingY} ${b.x - ux * 4.3 - wingX},${b.y - uy * 4.3 - wingY}`);
-      tip.setAttribute('fill', colors[index]); tip.setAttribute('opacity', opacities[index]);
-      arrow.appendChild(tip);
-      const dest = move.uci.slice(2, 4);
-      const slot = destinationSlots.get(dest) || 0;
-      destinationSlots.set(dest, slot + 1);
-      const label = document.createElementNS(svgNS, 'text');
-      label.setAttribute('x', b.x);
-      label.setAttribute('y', b.y + 4.3 - (destinationCounts.get(dest) - 1 - slot) * 3.2);
-      label.setAttribute('text-anchor', 'middle');
-      label.setAttribute('font-size', '2.8');
-      label.setAttribute('font-weight', '700');
-      label.setAttribute('font-family', 'system-ui,sans-serif');
-      label.setAttribute('fill', colors[index]);
-      label.setAttribute('stroke', '#10251b');
-      label.setAttribute('stroke-width', '0.8');
-      label.setAttribute('paint-order', 'stroke');
-      label.textContent = `${move.percent.toFixed(1)}%`;
-      arrow.appendChild(label);
-    });
+    const move = moves[0];
+    if (!board || !move) { arrow.style.display = 'none'; return; }
+    const a = squarePoint(move.uci.slice(0, 2));
+    const b = squarePoint(move.uci.slice(2, 4));
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const length = Math.hypot(dx, dy);
+    if (!length) { arrow.style.display = 'none'; return; }
+    const ux = dx / length, uy = dy / length;
+    const endX = b.x - ux * 3.2, endY = b.y - uy * 3.2;
+    const line = document.createElementNS(svgNS, 'line');
+    for (const [name, value] of Object.entries({x1: a.x, y1: a.y, x2: endX, y2: endY, stroke: '#24dc83', 'stroke-width': 1.8, 'stroke-linecap': 'round'})) line.setAttribute(name, value);
+    arrow.appendChild(line);
+    const tip = document.createElementNS(svgNS, 'polygon');
+    const wingX = -uy * 2.1, wingY = ux * 2.1;
+    tip.setAttribute('points', `${b.x},${b.y} ${b.x - ux * 4.3 + wingX},${b.y - uy * 4.3 + wingY} ${b.x - ux * 4.3 - wingX},${b.y - uy * 4.3 - wingY}`);
+    tip.setAttribute('fill', '#24dc83');
+    arrow.appendChild(tip);
+    const label = document.createElementNS(svgNS, 'text');
+    label.setAttribute('x', b.x);
+    label.setAttribute('y', b.y + 4.3);
+    label.setAttribute('text-anchor', 'middle');
+    label.setAttribute('font-size', '2.8');
+    label.setAttribute('font-weight', '700');
+    label.setAttribute('font-family', 'system-ui,sans-serif');
+    label.setAttribute('fill', '#24dc83');
+    label.setAttribute('stroke', '#10251b');
+    label.setAttribute('stroke-width', '0.8');
+    label.setAttribute('paint-order', 'stroke');
+    label.textContent = `${move.percent.toFixed(1)}%`;
+    arrow.appendChild(label);
     arrow.style.display = 'block';
     keepArrowAligned();
   }
@@ -534,7 +524,7 @@
         popup.document.getElementById('status').textContent = state.status;
         const list = popup.document.getElementById('moves');
         list.replaceChildren();
-        for (const move of state.moves) {
+        for (const move of state.moves.slice(0, 1)) {
           const item = popup.document.createElement('li');
           item.textContent = `${move.uci} (${move.percent.toFixed(1)}%)`;
           list.appendChild(item);
@@ -591,14 +581,12 @@
       if (!candidates.length) throw new Error('No legal moves mapped to model logits');
       const max = Math.max(...candidates.map(x => x.logit));
       const sum = candidates.reduce((acc, x) => acc + Math.exp(x.logit - max), 0);
-      candidates.sort((a, b) => b.logit - a.logit);
-      shownMoves = candidates.slice(0, 3).map(candidate => ({uci: candidate.uci, percent: 100 * Math.exp(candidate.logit - max) / sum}));
+      const best = candidates.reduce((leader, candidate) => candidate.logit > leader.logit ? candidate : leader);
+      shownMoves = [{uci: best.uci, percent: 100 * Math.exp(best.logit - max) / sum}];
       movesEl.replaceChildren();
-      for (const candidate of shownMoves) {
-        const li = document.createElement('li');
-        li.textContent = `${candidate.uci} (${candidate.percent.toFixed(1)}%)`;
-        movesEl.appendChild(li);
-      }
+      const li = document.createElement('li');
+      li.textContent = `${best.uci} (${shownMoves[0].percent.toFixed(1)}%)`;
+      movesEl.appendChild(li);
       drawArrows();
       showValue(output.logits_value?.data, black);
       setStatus(`Maia ${elo} · ${black ? 'Black' : 'White'} to move`);
@@ -612,7 +600,6 @@
 
   eloEl.addEventListener('change', () => {
     elo = Number(eloEl.value);
-    localStorage.setItem('maia-web-elo', String(elo));
     lastFen = '';
     scan();
   });
