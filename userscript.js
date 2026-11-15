@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Maia 3 Chess Board Assistant
 // @namespace    https://github.com/Jbsroboticsandautomationengineerstudent/Chess-study-training
-// @version      0.5.0
+// @version      0.6.0
 // @description  Local Maia ONNX move probabilities on Chess.com boards
 // @match        https://www.chess.com/*
 // @match        https://chess.com/*
@@ -57,6 +57,8 @@
   let streamPopup = null;
   let streamChannel = null;
   let popupChannel = null;
+  let lastStreamSignature = '';
+  let lastBoardOrientation = false;
   const seenPositions = new Map();
 
   const style = document.createElement('style');
@@ -155,38 +157,29 @@
     const marked = board.closest('.flipped, .orientation-black, [data-orientation="black"]');
     return Boolean(marked) !== flipOverride;
   }
-  function squarePoint(square) {
+  function squarePoint(square, black = isBlackView()) {
     const file = square.charCodeAt(0) - 97;
     const rank = Number(square[1]) - 1;
-    const black = isBlackView();
     return {x: (black ? 7 - file : file) * 12.5 + 6.25,
             y: (black ? rank : 7 - rank) * 12.5 + 6.25};
   }
-  function drawArrows(moves = shownMoves) {
-    if (streamerMode) {
-      arrow.replaceChildren();
-      arrow.style.display = 'none';
-      return;
-    }
-    arrow.replaceChildren();
-    const move = moves[0];
-    if (!board || !move) { arrow.style.display = 'none'; return; }
-    const a = squarePoint(move.uci.slice(0, 2));
-    const b = squarePoint(move.uci.slice(2, 4));
+  function paintMoveArrow(svg, doc, move, blackView) {
+    const a = squarePoint(move.uci.slice(0, 2), blackView);
+    const b = squarePoint(move.uci.slice(2, 4), blackView);
     const dx = b.x - a.x, dy = b.y - a.y;
     const length = Math.hypot(dx, dy);
-    if (!length) { arrow.style.display = 'none'; return; }
+    if (!length) return false;
     const ux = dx / length, uy = dy / length;
     const endX = b.x - ux * 3.2, endY = b.y - uy * 3.2;
-    const line = document.createElementNS(svgNS, 'line');
+    const line = doc.createElementNS(svgNS, 'line');
     for (const [name, value] of Object.entries({x1: a.x, y1: a.y, x2: endX, y2: endY, stroke: '#24dc83', 'stroke-width': 1.8, 'stroke-linecap': 'round'})) line.setAttribute(name, value);
-    arrow.appendChild(line);
-    const tip = document.createElementNS(svgNS, 'polygon');
+    svg.appendChild(line);
+    const tip = doc.createElementNS(svgNS, 'polygon');
     const wingX = -uy * 2.1, wingY = ux * 2.1;
     tip.setAttribute('points', `${b.x},${b.y} ${b.x - ux * 4.3 + wingX},${b.y - uy * 4.3 + wingY} ${b.x - ux * 4.3 - wingX},${b.y - uy * 4.3 - wingY}`);
     tip.setAttribute('fill', '#24dc83');
-    arrow.appendChild(tip);
-    const label = document.createElementNS(svgNS, 'text');
+    svg.appendChild(tip);
+    const label = doc.createElementNS(svgNS, 'text');
     label.setAttribute('x', b.x);
     label.setAttribute('y', b.y + 4.3);
     label.setAttribute('text-anchor', 'middle');
@@ -198,7 +191,48 @@
     label.setAttribute('stroke-width', '0.8');
     label.setAttribute('paint-order', 'stroke');
     label.textContent = `${move.percent.toFixed(1)}%`;
-    arrow.appendChild(label);
+    svg.appendChild(label);
+    return true;
+  }
+  function renderMiniBoard(doc, fen, blackView, move) {
+    const pieces = new Map();
+    const ranks = fen?.split(' ')[0]?.split('/') || [];
+    if (ranks.length === 8) {
+      ranks.forEach((rank, row) => {
+        let file = 0;
+        for (const symbol of rank) {
+          if (/^[1-8]$/.test(symbol)) file += Number(symbol);
+          else pieces.set(`${file++}${8 - row}`, symbol);
+        }
+      });
+    }
+    const glyph = {K: '♔', Q: '♕', R: '♖', B: '♗', N: '♘', P: '♙',
+      k: '♚', q: '♛', r: '♜', b: '♝', n: '♞', p: '♟'};
+    doc.querySelectorAll('#mini-board .square').forEach((cell, index) => {
+      const row = Math.floor(index / 8), col = index % 8;
+      const file = blackView ? 7 - col : col;
+      const rank = blackView ? row + 1 : 8 - row;
+      const piece = pieces.get(`${file}${rank}`);
+      const symbol = cell.firstElementChild;
+      symbol.textContent = glyph[piece] || '';
+      symbol.className = piece ? (piece === piece.toUpperCase() ? 'white-piece' : 'black-piece') : '';
+    });
+    const miniArrow = doc.getElementById('mini-arrow');
+    miniArrow.replaceChildren();
+    if (ranks.length === 8 && move) paintMoveArrow(miniArrow, doc, move, blackView);
+  }
+  function drawArrows(moves = shownMoves) {
+    if (streamerMode) {
+      arrow.replaceChildren();
+      arrow.style.display = 'none';
+      return;
+    }
+    arrow.replaceChildren();
+    const move = moves[0];
+    if (!board || !move || !paintMoveArrow(arrow, document, move, isBlackView())) {
+      arrow.style.display = 'none';
+      return;
+    }
     arrow.style.display = 'block';
     keepArrowAligned();
   }
@@ -322,6 +356,7 @@
       else arrow.style.display = 'none';
     }
     if (!board) { setStatus('Scanning Chess.com for a board…'); return; }
+    lastBoardOrientation = isBlackView();
     const directFen = boardFen(board);
     const placement = piecesFrom(board) || directFen?.fen().split(' ')[0];
     if (!placement) { setStatus('Board found. Waiting for position data…'); return; }
@@ -354,6 +389,7 @@
     if (session) void predict(fen);
     else if (!modelPromise) setStatus(modelError || 'Board ready. Load a compatible Maia ONNX model.');
     keepArrowAligned();
+    publishStreamState();
   }
   function scheduleScan() {
     clearTimeout(scanTimer);
@@ -460,13 +496,19 @@
   }
   function publishStreamState() {
     if (!streamerMode || !streamChannel) return;
-    streamChannel.postMessage({type: 'state', elo, status: statusEl.textContent,
+    const state = {type: 'state', elo, status: statusEl.textContent,
+      fen: game?.fen() || '', blackView: board ? isBlackView() : lastBoardOrientation,
       moves: shownMoves.map(move => ({uci: move.uci, percent: move.percent})),
-      logits_value: shownLogitsValue, value: shownValue ? [...shownValue] : null});
+      logits_value: shownLogitsValue, value: shownValue ? [...shownValue] : null};
+    const signature = JSON.stringify(state);
+    if (signature === lastStreamSignature) return;
+    lastStreamSignature = signature;
+    streamChannel.postMessage(state);
   }
   function stopStreamerMode() {
     if (!streamerMode) return;
     streamerMode = false;
+    lastStreamSignature = '';
     try { streamChannel?.close(); popupChannel?.close(); }
     catch { /* The popup may already be closed. */ }
     streamChannel = popupChannel = null;
@@ -483,7 +525,7 @@
       setStatus('This browser does not support BroadcastChannel.');
       return;
     }
-    const popup = window.open('', `maia-streamer-${Date.now()}`, 'popup,width=320,height=500');
+    const popup = window.open('', `maia-streamer-${Date.now()}`, 'popup,width=340,height=640');
     if (!popup) { setStatus('Allow popups for Chess.com, then try Streamer Mode again.'); return; }
     try {
       popup.document.open();
@@ -496,12 +538,28 @@
         #labels{display:flex;justify-content:space-between;font-size:11px;gap:4px}
         #bar{display:flex;height:16px;border:1px solid #708296;border-radius:6px;overflow:hidden;background:#33485d}
         #bar span{min-width:0;height:100%}#white{background:#f5f5ed}#draw{background:#cfb951}#black{background:#242b35}
+        #mini-board{position:relative;display:grid;grid-template-columns:repeat(8,1fr);width:240px;height:240px;
+          margin:10px auto;border:2px solid #708296;box-sizing:content-box}
+        #mini-board .square{display:flex;align-items:center;justify-content:center;font:27px/1 'Segoe UI Symbol',serif}
+        #mini-board .light{background:#eeeed2}#mini-board .dark{background:#769656}
+        #mini-board .white-piece{color:#fff;text-shadow:0 1px 2px #111,1px 0 #111,-1px 0 #111}
+        #mini-board .black-piece{color:#182018;text-shadow:0 1px 1px #fff9}
+        #mini-arrow{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible}
         </style></head><body><main><h1>Maia 3</h1><div class="row"><label for="elo">ELO</label><select id="elo"></select></div>
-        <div id="status">Connecting…</div><ol id="moves"></ol><div id="labels"><span>White win —</span><span>Draw —</span><span>Black win —</span></div>
+        <div id="status">Connecting…</div><div id="mini-board" aria-label="Current chess position"><svg id="mini-arrow" viewBox="0 0 100 100" aria-hidden="true"></svg></div>
+        <ol id="moves"></ol><div id="labels"><span>White win —</span><span>Draw —</span><span>Black win —</span></div>
         <div id="bar"><span id="white"></span><span id="draw"></span><span id="black"></span></div>
         <div class="row"><button id="off">Streamer Mode: ON · Turn off</button></div></main></body></html>`);
       popup.document.close();
       const popupElo = popup.document.getElementById('elo');
+      const miniBoard = popup.document.getElementById('mini-board');
+      const miniArrow = popup.document.getElementById('mini-arrow');
+      for (let row = 0; row < 8; row++) for (let col = 0; col < 8; col++) {
+        const cell = popup.document.createElement('div');
+        cell.className = `square ${(row + col) % 2 ? 'dark' : 'light'}`;
+        cell.appendChild(popup.document.createElement('span'));
+        miniBoard.insertBefore(cell, miniArrow);
+      }
       for (const rating of eloOptions) {
         const option = popup.document.createElement('option');
         option.value = option.textContent = String(rating);
@@ -522,6 +580,7 @@
         const state = event.data;
         popupElo.value = String(state.elo);
         popup.document.getElementById('status').textContent = state.status;
+        renderMiniBoard(popup.document, state.fen, state.blackView, state.moves[0]);
         const list = popup.document.getElementById('moves');
         list.replaceChildren();
         for (const move of state.moves.slice(0, 1)) {
