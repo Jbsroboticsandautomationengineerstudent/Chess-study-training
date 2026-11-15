@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Maia 3 Chess Board Assistant
 // @namespace    https://github.com/Jbsroboticsandautomationengineerstudent/Chess-study-training
-// @version      0.6.0
+// @version      0.7.0
 // @description  Local Maia ONNX move probabilities on Chess.com boards
 // @match        https://www.chess.com/*
 // @match        https://chess.com/*
@@ -59,6 +59,9 @@
   let popupChannel = null;
   let lastStreamSignature = '';
   let lastBoardOrientation = false;
+  let skinBoard = null;
+  let skinCheckedAt = 0;
+  let boardSkin = {light: '#eeeed2', dark: '#769656', pieces: {}};
   const seenPositions = new Map();
 
   const style = document.createElement('style');
@@ -194,7 +197,103 @@
     svg.appendChild(label);
     return true;
   }
-  function renderMiniBoard(doc, fen, blackView, move) {
+  function visibleColor(color) {
+    return Boolean(color && color !== 'transparent' &&
+      !/^rgba\([^)]*,\s*0(?:\.0+)?\s*\)$/.test(color));
+  }
+  function captureBoardSkin() {
+    if (!board) return boardSkin;
+    if (board === skinBoard && Date.now() - skinCheckedAt < 1500) return boardSkin;
+    skinBoard = board;
+    skinCheckedAt = Date.now();
+    const skin = {light: boardSkin.light, dark: boardSkin.dark, pieces: {}};
+    for (const el of board.querySelectorAll('.piece')) {
+      const code = [...el.classList].find(name => /^[wb][prnbqk]$/.test(name));
+      if (!code || skin.pieces[code]) continue;
+      let visual = null;
+      for (const source of [el, el.firstElementChild].filter(Boolean)) {
+        for (const pseudo of [null, '::before', '::after']) {
+          let style;
+          try { style = getComputedStyle(source, pseudo); }
+          catch { continue; }
+          const image = style.backgroundImage && style.backgroundImage !== 'none' ? style.backgroundImage : '';
+          const maskValue = style.maskImage || style.webkitMaskImage;
+          const mask = maskValue && maskValue !== 'none' ? maskValue : '';
+          if (!image && !mask) continue;
+          visual = {
+            backgroundImage: image, backgroundSize: style.backgroundSize,
+            backgroundPosition: style.backgroundPosition, backgroundRepeat: style.backgroundRepeat,
+            maskImage: mask, maskSize: style.maskSize || style.webkitMaskSize,
+            maskPosition: style.maskPosition || style.webkitMaskPosition,
+            maskRepeat: style.maskRepeat || style.webkitMaskRepeat,
+            backgroundColor: style.backgroundColor,
+            color: style.color, filter: style.filter,
+            sourceSize: source.getBoundingClientRect().width || el.getBoundingClientRect().width || board.getBoundingClientRect().width / 8
+          };
+          break;
+        }
+        if (visual) break;
+      }
+      if (!visual) {
+        const image = el.querySelector('img');
+        if (image?.currentSrc || image?.src) visual = {
+          backgroundImage: `url("${image.currentSrc || image.src}")`, backgroundSize: '100% 100%',
+          backgroundPosition: 'center', backgroundRepeat: 'no-repeat', maskImage: '',
+          filter: 'none', sourceSize: el.getBoundingClientRect().width || board.getBoundingClientRect().width / 8
+        };
+      }
+      if (visual) skin.pieces[code] = visual;
+    }
+    const squareColors = {light: new Map(), dark: new Map()};
+    for (const el of board.querySelectorAll('.square, .light, .dark, [class*="square-"]')) {
+      if (el.classList.contains('piece') || el.closest('.piece')) continue;
+      let kind = el.classList.contains('light') ? 'light' : el.classList.contains('dark') ? 'dark' : null;
+      if (!kind) {
+        const square = [...el.classList].map(name => /^square-([1-8])([1-8])$/.exec(name)).find(Boolean);
+        if (square) kind = (Number(square[1]) + Number(square[2])) % 2 ? 'light' : 'dark';
+      }
+      if (!kind) continue;
+      const color = getComputedStyle(el).backgroundColor;
+      if (visibleColor(color)) squareColors[kind].set(color, (squareColors[kind].get(color) || 0) + 1);
+    }
+    for (const kind of ['light', 'dark']) {
+      const colors = [...squareColors[kind]];
+      if (colors.length) skin[kind] = colors.sort((a, b) => b[1] - a[1])[0][0];
+    }
+    const boardStyle = getComputedStyle(board);
+    for (const el of (squareColors.light.size && squareColors.dark.size ? [] :
+      [board, board.querySelector('wc-chess-board, chess-board')].filter(Boolean))) {
+      for (const pseudo of [null, '::before']) {
+        let style;
+        try { style = getComputedStyle(el, pseudo); }
+        catch { continue; }
+        if (!style.backgroundImage || style.backgroundImage === 'none') continue;
+        skin.boardBackgroundImage = style.backgroundImage;
+        skin.boardBackgroundSize = style.backgroundSize;
+        skin.boardBackgroundPosition = style.backgroundPosition;
+        skin.sourceBoardSize = el.getBoundingClientRect().width;
+        break;
+      }
+      if (skin.boardBackgroundImage) break;
+    }
+    const variables = {
+      light: ['--light-square-color', '--board-color-light', '--board-light', '--light-square', '--color-board-light'],
+      dark: ['--dark-square-color', '--board-color-dark', '--board-dark', '--dark-square', '--color-board-dark']
+    };
+    for (const kind of ['light', 'dark']) {
+      for (const name of variables[kind]) {
+        const color = boardStyle.getPropertyValue(name).trim();
+        if (visibleColor(color) && CSS.supports('color', color)) { skin[kind] = color; break; }
+      }
+    }
+    boardSkin = skin;
+    return skin;
+  }
+  function scaleCssPixels(value, factor) {
+    return String(value || '').replace(/(-?\d+(?:\.\d+)?)px/g,
+      (_, size) => `${(Number(size) * factor).toFixed(2)}px`);
+  }
+  function renderMiniBoard(doc, fen, blackView, move, skin) {
     const pieces = new Map();
     const ranks = fen?.split(' ')[0]?.split('/') || [];
     if (ranks.length === 8) {
@@ -208,14 +307,48 @@
     }
     const glyph = {K: '♔', Q: '♕', R: '♖', B: '♗', N: '♘', P: '♙',
       k: '♚', q: '♛', r: '♜', b: '♝', n: '♞', p: '♟'};
+    const miniBoard = doc.getElementById('mini-board');
+    miniBoard.style.backgroundImage = skin?.boardBackgroundImage || '';
+    miniBoard.style.backgroundSize = skin?.boardBackgroundImage ?
+      (skin.boardBackgroundSize === 'auto' || skin.boardBackgroundSize === 'auto auto' ?
+        '100% 100%' : scaleCssPixels(skin.boardBackgroundSize, 240 / (skin.sourceBoardSize || 240))) : '';
+    miniBoard.style.backgroundPosition = skin?.boardBackgroundImage ?
+      scaleCssPixels(skin.boardBackgroundPosition, 240 / (skin.sourceBoardSize || 240)) : '';
     doc.querySelectorAll('#mini-board .square').forEach((cell, index) => {
       const row = Math.floor(index / 8), col = index % 8;
       const file = blackView ? 7 - col : col;
       const rank = blackView ? row + 1 : 8 - row;
       const piece = pieces.get(`${file}${rank}`);
       const symbol = cell.firstElementChild;
-      symbol.textContent = glyph[piece] || '';
-      symbol.className = piece ? (piece === piece.toUpperCase() ? 'white-piece' : 'black-piece') : '';
+      cell.style.backgroundColor = skin?.boardBackgroundImage ? 'transparent' :
+        (row + col) % 2 ? skin?.dark || '#769656' : skin?.light || '#eeeed2';
+      symbol.removeAttribute('style');
+      const code = piece ? `${piece === piece.toUpperCase() ? 'w' : 'b'}${piece.toLowerCase()}` : '';
+      const visual = skin?.pieces?.[code];
+      if (visual) {
+        const scale = 30 / (visual.sourceSize || 30);
+        symbol.textContent = '';
+        symbol.className = '';
+        symbol.style.width = '100%';
+        symbol.style.height = '100%';
+        symbol.style.backgroundImage = visual.backgroundImage;
+        symbol.style.backgroundSize = scaleCssPixels(visual.backgroundSize, scale);
+        symbol.style.backgroundPosition = scaleCssPixels(visual.backgroundPosition, scale);
+        symbol.style.backgroundRepeat = visual.backgroundRepeat;
+        symbol.style.maskImage = visual.maskImage;
+        symbol.style.webkitMaskImage = visual.maskImage;
+        symbol.style.maskSize = scaleCssPixels(visual.maskSize, scale);
+        symbol.style.webkitMaskSize = scaleCssPixels(visual.maskSize, scale);
+        symbol.style.maskPosition = scaleCssPixels(visual.maskPosition, scale);
+        symbol.style.webkitMaskPosition = scaleCssPixels(visual.maskPosition, scale);
+        symbol.style.maskRepeat = visual.maskRepeat;
+        symbol.style.webkitMaskRepeat = visual.maskRepeat;
+        symbol.style.backgroundColor = visual.maskImage ? (visibleColor(visual.backgroundColor) ? visual.backgroundColor : visual.color) : '';
+        symbol.style.filter = visual.filter;
+      } else {
+        symbol.textContent = glyph[piece] || '';
+        symbol.className = piece ? (piece === piece.toUpperCase() ? 'white-piece' : 'black-piece') : '';
+      }
     });
     const miniArrow = doc.getElementById('mini-arrow');
     miniArrow.replaceChildren();
@@ -498,6 +631,7 @@
     if (!streamerMode || !streamChannel) return;
     const state = {type: 'state', elo, status: statusEl.textContent,
       fen: game?.fen() || '', blackView: board ? isBlackView() : lastBoardOrientation,
+      skin: captureBoardSkin(),
       moves: shownMoves.map(move => ({uci: move.uci, percent: move.percent})),
       logits_value: shownLogitsValue, value: shownValue ? [...shownValue] : null};
     const signature = JSON.stringify(state);
@@ -508,6 +642,8 @@
   function stopStreamerMode() {
     if (!streamerMode) return;
     streamerMode = false;
+    try { localStorage.setItem('maia-streamer-active', 'false'); }
+    catch { /* Private browsing may disable storage. */ }
     lastStreamSignature = '';
     try { streamChannel?.close(); popupChannel?.close(); }
     catch { /* The popup may already be closed. */ }
@@ -525,7 +661,7 @@
       setStatus('This browser does not support BroadcastChannel.');
       return;
     }
-    const popup = window.open('', `maia-streamer-${Date.now()}`, 'popup,width=340,height=640');
+    const popup = window.open('', 'maia-streamer-popup', 'popup,width=340,height=640');
     if (!popup) { setStatus('Allow popups for Chess.com, then try Streamer Mode again.'); return; }
     try {
       popup.document.open();
@@ -580,7 +716,7 @@
         const state = event.data;
         popupElo.value = String(state.elo);
         popup.document.getElementById('status').textContent = state.status;
-        renderMiniBoard(popup.document, state.fen, state.blackView, state.moves[0]);
+        renderMiniBoard(popup.document, state.fen, state.blackView, state.moves[0], state.skin);
         const list = popup.document.getElementById('moves');
         list.replaceChildren();
         for (const move of state.moves.slice(0, 1)) {
@@ -599,6 +735,8 @@
       popup.document.getElementById('off').addEventListener('click', () => popupChannel.postMessage({type: 'off'}));
       streamPopup = popup;
       streamerMode = true;
+      try { localStorage.setItem('maia-streamer-active', 'true'); }
+      catch { /* Private browsing may disable storage. */ }
       arrow.replaceChildren();
       arrow.style.display = 'none';
       arrow.remove();
@@ -712,9 +850,12 @@
   addEventListener('pageshow', scheduleScan);
   addEventListener('popstate', scheduleScan);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) scheduleScan(); });
-  addEventListener('pagehide', stopStreamerMode);
   setInterval(() => { if (streamerMode && streamPopup?.closed) stopStreamerMode(); }, 500);
   setInterval(scan, 300);
   scan();
   void loadModel();
+  try {
+    if (localStorage.getItem('maia-streamer-active') === 'true')
+      setTimeout(startStreamerMode, 400);
+  } catch { /* Keep manual mode available when storage is disabled. */ }
 })();
