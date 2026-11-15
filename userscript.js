@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Maia 3 Chess Board Assistant
 // @namespace    https://github.com/Jbsroboticsandautomationengineerstudent/Chess-study-training
-// @version      0.8.0
+// @version      0.9.0
 // @description  Local Maia ONNX move probabilities on Chess.com boards
 // @match        https://www.chess.com/*
 // @match        https://chess.com/*
@@ -30,6 +30,7 @@
 
   if (window.top !== window || document.getElementById('maia-web-panel')) return;
   const MODEL_URL = 'https://huggingface.co/cstr/maia3-onnx-int32/resolve/main/maia3_79m_int32.onnx';
+  const MODEL_BYTES = 313204242;
   const ORT_DIST = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/';
   const ChessClass = typeof Chess !== 'undefined' ? Chess : window.Chess;
   const ortApi = typeof ort !== 'undefined' ? ort : window.ort;
@@ -86,6 +87,9 @@
     #maia-web-panel select{flex:1} #maia-web-panel button{cursor:pointer}
     #maia-web-panel input{width:100%;font:11px/1.4 ui-monospace,monospace}
     #maia-web-status{color:#c6d5e4;min-height:32px;margin:5px 0;white-space:pre-wrap}
+    #maia-web-progress{height:7px;margin:5px 0 8px;background:#33485d;border-radius:5px;overflow:hidden}
+    #maia-web-progress[hidden]{display:none}
+    #maia-web-progress-fill{height:100%;width:0;background:#24dc83;transition:width .15s}
     #maia-web-opening{color:#a9dbc2;font-size:12px;min-height:18px;margin:3px 0}
     #maia-web-moves{margin:6px 0 8px;padding-left:21px;font:14px/1.6 ui-monospace,monospace}
     #maia-web-fen{overflow-wrap:anywhere;color:#a9b9c9;font:10px/1.3 ui-monospace,monospace}
@@ -106,6 +110,7 @@
     <div class="body">
       <div class="row"><button id="maia-web-flip" title="Reverse arrow orientation">Flip</button></div>
       <div id="maia-web-status">Finding board…</div>
+      <div id="maia-web-progress" role="progressbar" aria-label="Model download" aria-valuemin="0" aria-valuemax="100" hidden><div id="maia-web-progress-fill"></div></div>
       <div id="maia-web-opening">Opening: —</div>
       <ol id="maia-web-moves"></ol>
       <div id="maia-web-value"><div id="maia-web-value-label"><span>White win —</span><span>Draw —</span><span>Black win —</span></div>
@@ -119,6 +124,8 @@
     </div>`;
   document.documentElement.appendChild(panel);
   const statusEl = panel.querySelector('#maia-web-status');
+  const progressEl = panel.querySelector('#maia-web-progress');
+  const progressFillEl = panel.querySelector('#maia-web-progress-fill');
   const openingEl = panel.querySelector('#maia-web-opening');
   const movesEl = panel.querySelector('#maia-web-moves');
   const fenEl = panel.querySelector('#maia-web-fen');
@@ -374,22 +381,23 @@
     keepArrowAligned();
   }
 
-  // The site's class square-XY uses file X and rank Y, independent of rotation.
+  // Square coordinates use file X and rank Y, independent of rotation.
   function piecesFrom(boardElement) {
     const pieces = new Map();
     for (const el of boardElement.querySelectorAll('.piece')) {
       const classes = Array.from(el.classList);
       const piece = classes.find(c => /^[wb][prnbqk]$/.test(c));
-      const square = classes.map(c => /^square-([1-8])([1-8])$/.exec(c)).find(Boolean);
+      const classSquare = classes.map(c => /^square-([1-8])([1-8])$/.exec(c)).find(Boolean);
+      const dataSquare = el.getAttribute('data-square');
+      const square = /^[1-8]{2}$/.test(dataSquare || '') ? dataSquare :
+        classSquare ? `${classSquare[1]}${classSquare[2]}` : null;
       if (!piece || !square) continue;
-      if (pieces.has(`${square[1]}${square[2]}`)) {
-        // Chess.com may briefly duplicate a piece while animating a move.
-        if (pieces.get(`${square[1]}${square[2]}`) !== piece) return null;
-        continue;
-      }
-      pieces.set(`${square[1]}${square[2]}`, piece);
+      if (pieces.has(square)) continue; // Ignore animation duplicates at the same square.
+      if ((piece === 'wk' || piece === 'bk') && [...pieces.values()].includes(piece)) continue;
+      if (pieces.size >= 32) continue; // A moving piece may briefly exist at two squares.
+      pieces.set(square, piece);
     }
-    if (!pieces.size || pieces.size > 32) return null;
+    if (!pieces.size) return null;
     if ([...pieces.values()].filter(p => p === 'wk').length !== 1 ||
         [...pieces.values()].filter(p => p === 'bk').length !== 1) return null;
     let placement = '';
@@ -514,7 +522,7 @@
     if (!board) { setStatus('Scanning Chess.com for a board…'); return; }
     lastBoardOrientation = isBlackView();
     const directFen = boardFen(board);
-    const placement = piecesFrom(board) || directFen?.fen().split(' ')[0];
+    const placement = directFen?.fen().split(' ')[0] || piecesFrom(board);
     if (!placement) { setStatus('Board found. Waiting for position data…'); return; }
     if (placement === START_PLACEMENT && lastBoard !== START_PLACEMENT) firstMoveChoice = '';
     const fromSite = (directFen?.fen().split(' ')[0] === placement ? directFen : null) || siteFen(placement);
@@ -553,19 +561,48 @@
     scanTimer = setTimeout(scan, 60);
   }
 
+  function updateDownloadProgress(loaded, total = MODEL_BYTES) {
+    const percent = Math.min(100, Math.floor(100 * loaded / (total || MODEL_BYTES)));
+    progressEl.hidden = false;
+    progressEl.setAttribute('aria-valuenow', String(percent));
+    progressFillEl.style.width = `${percent}%`;
+    setStatus(`Downloading Maia 79M: ${percent}% (${(loaded / 1e6).toFixed(0)} MB)`);
+  }
   async function downloadModel(url) {
     if (typeof GM_xmlhttpRequest === 'function') {
       try {
         return await new Promise((resolve, reject) => GM_xmlhttpRequest({
           method: 'GET', url, responseType: 'arraybuffer',
-          onload: r => r.status === 200 ? resolve(r.response) : reject(new Error(`Model HTTP ${r.status}`)),
+          onprogress: e => updateDownloadProgress(e.loaded, e.lengthComputable ? e.total : MODEL_BYTES),
+          onload: r => {
+            if (r.status !== 200) { reject(new Error(`Model HTTP ${r.status}`)); return; }
+            updateDownloadProgress(r.response?.byteLength || MODEL_BYTES);
+            resolve(r.response);
+          },
           onerror: () => reject(new Error('Model download failed'))
         }));
       } catch (error) { console.warn('[Maia] Userscript download failed, trying browser fetch:', error); }
     }
     const response = await fetch(url);
     if (!response.ok) throw new Error(`Model HTTP ${response.status}`);
-    return response.arrayBuffer();
+    if (!response.body) {
+      const bytes = await response.arrayBuffer();
+      updateDownloadProgress(bytes.byteLength);
+      return bytes;
+    }
+    const total = Number(response.headers.get('Content-Length')) || MODEL_BYTES;
+    const bytes = new Uint8Array(total);
+    const reader = response.body.getReader();
+    let received = 0;
+    for (;;) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      if (received + value.byteLength > bytes.byteLength) throw new Error('Model download exceeded expected size');
+      bytes.set(value, received);
+      received += value.byteLength;
+      updateDownloadProgress(received, total);
+    }
+    return received === bytes.byteLength ? bytes.buffer : bytes.buffer.slice(0, received);
   }
   function modelCache() {
     return new Promise((resolve, reject) => {
@@ -612,7 +649,7 @@
       if (bytes && bytes.byteLength < 300_000_000) bytes = null;
       if (bytes) setStatus('Loading cached Maia 79M model…');
       else {
-        setStatus('Downloading Maia 79M model (~313 MB)…');
+        updateDownloadProgress(0);
         bytes = await downloadModel(MODEL_URL);
         if (!(bytes instanceof ArrayBuffer) || bytes.byteLength < 300_000_000)
           throw new Error('Maia 79M download is incomplete');
@@ -641,11 +678,13 @@
       setStatus(`Maia 79M loaded on ${backend}.`);
       lastFen = '';
       scan();
+      const placement = board && (boardFen(board)?.fen().split(' ')[0] || piecesFrom(board));
+      if (game && placement === game.fen().split(' ')[0]) void predict(game.fen());
     })().catch(error => {
       session = null;
       modelError = `Model unavailable: ${error.message}`;
       setStatus(modelError);
-    }).finally(() => { modelPromise = null; });
+    }).finally(() => { modelPromise = null; progressEl.hidden = true; });
     return modelPromise;
   }
 
@@ -924,7 +963,7 @@
     })) scheduleScan();
   }).observe(document.documentElement, {
     subtree: true, childList: true, characterData: true, attributes: true,
-    attributeFilter: ['class', 'style', 'data-fen', 'data-orientation', 'aria-hidden']
+    attributeFilter: ['class', 'style', 'data-square', 'data-fen', 'data-orientation', 'aria-hidden']
   });
   addEventListener('resize', keepArrowAligned);
   addEventListener('scroll', keepArrowAligned, true);
