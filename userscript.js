@@ -1,20 +1,22 @@
 // ==UserScript==
 // @name         Maia 3 Chess Board Assistant
 // @namespace    https://github.com/Jbsroboticsandautomationengineerstudent/Chess-study-training
-// @version      0.7.0
+// @version      0.8.0
 // @description  Local Maia ONNX move probabilities on Chess.com boards
 // @match        https://www.chess.com/*
 // @match        https://chess.com/*
 // @run-at       document-idle
 // @inject-into  content
 // @require      https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js
-// @require      https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/ort.min.js
-// @connect      jbsroboticsandautomationengineerstudent.github.io
+// @require      https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/ort.webgpu.min.js
+// @connect      huggingface.co
+// @connect      cas-bridge.xethub.hf.co
+// @connect      cdn-lfs.hf.co
 // @grant        GM_xmlhttpRequest
 // ==/UserScript==
 
 /*
- * Model contract (the model is published from web/models/maia3_5m.onnx):
+ * Model contract (the 79M ONNX model is fetched from Hugging Face):
  *   tokens      float32 [1,64,96]
  *   self_elo    int32 or int64 [1]
  *   oppo_elo    int32 or int64 [1]
@@ -27,7 +29,7 @@
   'use strict';
 
   if (window.top !== window || document.getElementById('maia-web-panel')) return;
-  const MODEL_URL = 'https://jbsroboticsandautomationengineerstudent.github.io/Chess-study-training/models/maia3_5m.onnx';
+  const MODEL_URL = 'https://huggingface.co/cstr/maia3-onnx-int32/resolve/main/maia3_79m_int32.onnx';
   const ORT_DIST = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/';
   const ChessClass = typeof Chess !== 'undefined' ? Chess : window.Chess;
   const ortApi = typeof ort !== 'undefined' ? ort : window.ort;
@@ -36,13 +38,17 @@
     return;
   }
 
-  const eloOptions = [500, 600, 700, 800, 900, 1000, 1100, 1300, 1500, 1700, 1900, 2100, 2300, 2500, 2600, 2700];
-  let elo = 2700;
+  const ELO = 2700;
+  const OPENING_MOVES = ['e2e4', 'd2d4', 'c2c4', 'g1f3'];
+  const START_PLACEMENT = new ChessClass().fen().split(' ')[0];
   let board = null;
   let game = null;
   let session = null;
   let modelPromise = null;
   let modelError = '';
+  let backend = '';
+  let openingName = '';
+  let firstMoveChoice = '';
   let lastFen = '';
   let lastBoard = '';
   let missedBoard = '';
@@ -80,6 +86,7 @@
     #maia-web-panel select{flex:1} #maia-web-panel button{cursor:pointer}
     #maia-web-panel input{width:100%;font:11px/1.4 ui-monospace,monospace}
     #maia-web-status{color:#c6d5e4;min-height:32px;margin:5px 0;white-space:pre-wrap}
+    #maia-web-opening{color:#a9dbc2;font-size:12px;min-height:18px;margin:3px 0}
     #maia-web-moves{margin:6px 0 8px;padding-left:21px;font:14px/1.6 ui-monospace,monospace}
     #maia-web-fen{overflow-wrap:anywhere;color:#a9b9c9;font:10px/1.3 ui-monospace,monospace}
     #maia-web-value{margin:7px 0 9px}
@@ -95,12 +102,11 @@
   const panel = document.createElement('div');
   panel.id = 'maia-web-panel';
   panel.innerHTML = `
-    <div id="maia-web-head"><span>Maia 3</span><span>drag</span></div>
+    <div id="maia-web-head"><span>Maia 79M (Max Strength)</span><span>drag</span></div>
     <div class="body">
-      <div class="row"><label for="maia-web-elo">ELO</label>
-        <select id="maia-web-elo"></select>
-        <button id="maia-web-flip" title="Reverse arrow orientation">Flip</button></div>
+      <div class="row"><button id="maia-web-flip" title="Reverse arrow orientation">Flip</button></div>
       <div id="maia-web-status">Finding board…</div>
+      <div id="maia-web-opening">Opening: —</div>
       <ol id="maia-web-moves"></ol>
       <div id="maia-web-value"><div id="maia-web-value-label"><span>White win —</span><span>Draw —</span><span>Black win —</span></div>
         <div id="maia-web-value-bar" role="img" aria-label="Win probabilities"><span id="maia-web-white"></span><span id="maia-web-draw"></span><span id="maia-web-black"></span></div></div>
@@ -113,13 +119,11 @@
     </div>`;
   document.documentElement.appendChild(panel);
   const statusEl = panel.querySelector('#maia-web-status');
+  const openingEl = panel.querySelector('#maia-web-opening');
   const movesEl = panel.querySelector('#maia-web-moves');
   const fenEl = panel.querySelector('#maia-web-fen');
-  const eloEl = panel.querySelector('#maia-web-elo');
   const valueLabels = panel.querySelectorAll('#maia-web-value-label span');
   const valueSegments = ['#maia-web-white', '#maia-web-draw', '#maia-web-black'].map(selector => panel.querySelector(selector));
-  for (const rating of eloOptions) eloEl.add(new Option(String(rating), String(rating)));
-  eloEl.value = String(elo);
 
   const arrow = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
   arrow.id = 'maia-web-arrow';
@@ -480,10 +484,29 @@
     const positions = seenPositions.get(placement);
     return positions?.size === 1 ? tryLoadFen([...positions][0], placement) : null;
   }
+  function readOpeningName() {
+    const selectors = ['.opening-name', '.eco-name', '.opening-info-name',
+      '[data-cy="opening-name"]', '[data-testid="opening-name"]'];
+    for (const selector of selectors) {
+      for (const el of document.querySelectorAll(selector)) {
+        if (el.closest('#maia-web-panel')) continue;
+        const name = el.textContent?.trim().replace(/\s+/g, ' ');
+        if (name && name.length <= 100) return name;
+      }
+    }
+    return '';
+  }
 
   function scan() {
+    const currentOpening = readOpeningName();
+    if (currentOpening !== openingName) {
+      openingName = currentOpening;
+      openingEl.textContent = `Opening: ${openingName || '—'}`;
+      publishStreamState();
+    }
     const found = findBoard();
     if (found !== board) {
+      if (found && found !== board && lastBoard === START_PLACEMENT) firstMoveChoice = '';
       board = found;
       if (board && shownMoves.length) drawArrows();
       else arrow.style.display = 'none';
@@ -493,6 +516,7 @@
     const directFen = boardFen(board);
     const placement = piecesFrom(board) || directFen?.fen().split(' ')[0];
     if (!placement) { setStatus('Board found. Waiting for position data…'); return; }
+    if (placement === START_PLACEMENT && lastBoard !== START_PLACEMENT) firstMoveChoice = '';
     const fromSite = (directFen?.fen().split(' ')[0] === placement ? directFen : null) || siteFen(placement);
     if (placement !== lastBoard || !game || (fromSite && fromSite.fen() !== game.fen())) {
       let next = fromSite;
@@ -529,34 +553,92 @@
     scanTimer = setTimeout(scan, 60);
   }
 
-  function downloadModel(url) {
+  async function downloadModel(url) {
     if (typeof GM_xmlhttpRequest === 'function') {
-      return new Promise((resolve, reject) => GM_xmlhttpRequest({
-        method: 'GET', url, responseType: 'arraybuffer',
-        onload: r => r.status === 200 ? resolve(r.response) : reject(new Error(`Model HTTP ${r.status}`)),
-        onerror: () => reject(new Error('Model download failed'))
-      }));
+      try {
+        return await new Promise((resolve, reject) => GM_xmlhttpRequest({
+          method: 'GET', url, responseType: 'arraybuffer',
+          onload: r => r.status === 200 ? resolve(r.response) : reject(new Error(`Model HTTP ${r.status}`)),
+          onerror: () => reject(new Error('Model download failed'))
+        }));
+      } catch (error) { console.warn('[Maia] Userscript download failed, trying browser fetch:', error); }
     }
-    return fetch(url).then(r => {
-      if (!r.ok) throw new Error(`Model HTTP ${r.status}`);
-      return r.arrayBuffer();
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`Model HTTP ${response.status}`);
+    return response.arrayBuffer();
+  }
+  function modelCache() {
+    return new Promise((resolve, reject) => {
+      if (!window.indexedDB) { reject(new Error('IndexedDB unavailable')); return; }
+      const request = indexedDB.open('maia-onnx-cache', 1);
+      request.onupgradeneeded = () => request.result.createObjectStore('models');
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error || new Error('IndexedDB open failed'));
     });
+  }
+  async function cachedModelBytes() {
+    const db = await modelCache();
+    try {
+      const blob = await new Promise((resolve, reject) => {
+        const request = db.transaction('models', 'readonly').objectStore('models').get(MODEL_URL);
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      return blob instanceof Blob ? blob.arrayBuffer() : null;
+    } finally { db.close(); }
+  }
+  async function cacheModelBytes(bytes) {
+    const db = await modelCache();
+    try {
+      await new Promise((resolve, reject) => {
+        const transaction = db.transaction('models', 'readwrite');
+        transaction.objectStore('models').put(new Blob([bytes]), MODEL_URL);
+        transaction.oncomplete = resolve;
+        transaction.onerror = () => reject(transaction.error);
+        transaction.onabort = () => reject(transaction.error);
+      });
+    } finally { db.close(); }
   }
   async function loadModel() {
     if (modelPromise) return modelPromise;
     modelError = '';
-    setStatus('Downloading Maia ONNX model…');
+    setStatus('Loading Maia 79M model…');
     modelPromise = (async () => {
       ortApi.env.wasm.wasmPaths = ORT_DIST;
       ortApi.env.wasm.numThreads = 1; // Safari does not always permit threaded WASM.
-      const bytes = await downloadModel(MODEL_URL);
-      session = await ortApi.InferenceSession.create(bytes, {executionProviders: ['wasm']});
+      let bytes;
+      try { bytes = await cachedModelBytes(); }
+      catch (error) { console.warn('[Maia] Cache read failed:', error); }
+      if (bytes && bytes.byteLength < 300_000_000) bytes = null;
+      if (bytes) setStatus('Loading cached Maia 79M model…');
+      else {
+        setStatus('Downloading Maia 79M model (~313 MB)…');
+        bytes = await downloadModel(MODEL_URL);
+        if (!(bytes instanceof ArrayBuffer) || bytes.byteLength < 300_000_000)
+          throw new Error('Maia 79M download is incomplete');
+        try { await cacheModelBytes(bytes); }
+        catch (error) { console.warn('[Maia] Model cache unavailable:', error); }
+      }
+      if (navigator.gpu) {
+        try {
+          setStatus('Initializing Maia 79M on WebGPU…');
+          session = await ortApi.InferenceSession.create(bytes, {executionProviders: ['webgpu', 'wasm']});
+          backend = 'WebGPU';
+        } catch (error) {
+          console.warn('[Maia] WebGPU unavailable for this model:', error);
+        }
+      }
+      if (!session) {
+        setStatus('Initializing Maia 79M on CPU…');
+        session = await ortApi.InferenceSession.create(bytes, {executionProviders: ['wasm']});
+        backend = 'CPU';
+      }
       for (const name of ['tokens', 'self_elo', 'oppo_elo']) {
         if (!session.inputNames.includes(name)) throw new Error(`ONNX input '${name}' missing`);
       }
       if (!session.outputNames.some(name => name === 'logits_move' || name === 'move_logits'))
         throw new Error("ONNX output 'logits_move' or 'move_logits' missing");
-      setStatus('Maia model loaded.');
+      setStatus(`Maia 79M loaded on ${backend}.`);
       lastFen = '';
       scan();
     })().catch(error => {
@@ -604,9 +686,9 @@
     const inputIndex = session.inputNames.indexOf(name);
     const type = session.inputMetadata?.[inputIndex]?.type || 'tensor(int32)';
     if (type === 'int64' || type === 'tensor(int64)')
-      return new ortApi.Tensor('int64', BigInt64Array.of(BigInt(elo)), [1]);
+      return new ortApi.Tensor('int64', BigInt64Array.of(BigInt(ELO)), [1]);
     if (type === 'int32' || type === 'tensor(int32)')
-      return new ortApi.Tensor('int32', Int32Array.of(elo), [1]);
+      return new ortApi.Tensor('int32', Int32Array.of(ELO), [1]);
     throw new Error(`${name} must be int32 or int64, got ${type}`);
   }
   function showValue(logits, blackToMove) {
@@ -629,7 +711,7 @@
   }
   function publishStreamState() {
     if (!streamerMode || !streamChannel) return;
-    const state = {type: 'state', elo, status: statusEl.textContent,
+    const state = {type: 'state', status: statusEl.textContent, opening: openingName,
       fen: game?.fen() || '', blackView: board ? isBlackView() : lastBoardOrientation,
       skin: captureBoardSkin(),
       moves: shownMoves.map(move => ({uci: move.uci, percent: move.percent})),
@@ -665,11 +747,11 @@
     if (!popup) { setStatus('Allow popups for Chess.com, then try Streamer Mode again.'); return; }
     try {
       popup.document.open();
-      popup.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>Maia 3 Streamer View</title>
+      popup.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>Maia 79M Streamer View</title>
         <style>body{margin:0;background:#121c28;color:#f6f8fb;font:14px/1.5 system-ui,-apple-system,sans-serif}
         main{padding:16px}h1{margin:0 0 14px;font-size:18px}.row{display:flex;align-items:center;gap:8px;margin:10px 0}
-        select,button{background:#33485d;color:#fff;border:1px solid #708296;border-radius:6px;padding:7px;font:inherit}
-        select{flex:1}button{cursor:pointer}#status{color:#c6d5e4;min-height:40px;margin:12px 0}
+        button{background:#33485d;color:#fff;border:1px solid #708296;border-radius:6px;padding:7px;font:inherit;cursor:pointer}
+        #status{color:#c6d5e4;min-height:40px;margin:12px 0}#opening{color:#a9dbc2;margin:6px 0}
         ol{padding-left:24px;font:16px/1.8 ui-monospace,monospace;min-height:88px}
         #labels{display:flex;justify-content:space-between;font-size:11px;gap:4px}
         #bar{display:flex;height:16px;border:1px solid #708296;border-radius:6px;overflow:hidden;background:#33485d}
@@ -681,13 +763,12 @@
         #mini-board .white-piece{color:#fff;text-shadow:0 1px 2px #111,1px 0 #111,-1px 0 #111}
         #mini-board .black-piece{color:#182018;text-shadow:0 1px 1px #fff9}
         #mini-arrow{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible}
-        </style></head><body><main><h1>Maia 3</h1><div class="row"><label for="elo">ELO</label><select id="elo"></select></div>
-        <div id="status">Connecting…</div><div id="mini-board" aria-label="Current chess position"><svg id="mini-arrow" viewBox="0 0 100 100" aria-hidden="true"></svg></div>
+        </style></head><body><main><h1>Maia 79M (Max Strength)</h1><div id="status">Connecting…</div>
+        <div id="opening">Opening: —</div><div id="mini-board" aria-label="Current chess position"><svg id="mini-arrow" viewBox="0 0 100 100" aria-hidden="true"></svg></div>
         <ol id="moves"></ol><div id="labels"><span>White win —</span><span>Draw —</span><span>Black win —</span></div>
         <div id="bar"><span id="white"></span><span id="draw"></span><span id="black"></span></div>
         <div class="row"><button id="off">Streamer Mode: ON · Turn off</button></div></main></body></html>`);
       popup.document.close();
-      const popupElo = popup.document.getElementById('elo');
       const miniBoard = popup.document.getElementById('mini-board');
       const miniArrow = popup.document.getElementById('mini-arrow');
       for (let row = 0; row < 8; row++) for (let col = 0; col < 8; col++) {
@@ -696,26 +777,17 @@
         cell.appendChild(popup.document.createElement('span'));
         miniBoard.insertBefore(cell, miniArrow);
       }
-      for (const rating of eloOptions) {
-        const option = popup.document.createElement('option');
-        option.value = option.textContent = String(rating);
-        popupElo.appendChild(option);
-      }
       const channelName = `maia-streamer-${crypto.randomUUID?.() || Date.now()}`;
       streamChannel = new BroadcastChannel(channelName);
       popupChannel = new popup.BroadcastChannel(channelName);
       streamChannel.onmessage = event => {
         if (event.data?.type === 'off') stopStreamerMode();
-        if (event.data?.type === 'elo' && eloOptions.includes(event.data.elo)) {
-          eloEl.value = String(event.data.elo);
-          eloEl.dispatchEvent(new Event('change'));
-        }
       };
       popupChannel.onmessage = event => {
         if (event.data?.type !== 'state' || popup.closed) return;
         const state = event.data;
-        popupElo.value = String(state.elo);
         popup.document.getElementById('status').textContent = state.status;
+        popup.document.getElementById('opening').textContent = `Opening: ${state.opening || '—'}`;
         renderMiniBoard(popup.document, state.fen, state.blackView, state.moves[0], state.skin);
         const list = popup.document.getElementById('moves');
         list.replaceChildren();
@@ -731,7 +803,6 @@
           segments[index].style.width = state.value ? `${state.value[index]}%` : '0%';
         });
       };
-      popupElo.addEventListener('change', () => popupChannel.postMessage({type: 'elo', elo: Number(popupElo.value)}));
       popup.document.getElementById('off').addEventListener('click', () => popupChannel.postMessage({type: 'off'}));
       streamPopup = popup;
       streamerMode = true;
@@ -778,7 +849,22 @@
       if (!candidates.length) throw new Error('No legal moves mapped to model logits');
       const max = Math.max(...candidates.map(x => x.logit));
       const sum = candidates.reduce((acc, x) => acc + Math.exp(x.logit - max), 0);
-      const best = candidates.reduce((leader, candidate) => candidate.logit > leader.logit ? candidate : leader);
+      candidates.sort((a, b) => b.logit - a.logit);
+      let best = candidates[0];
+      if (!black && !isBlackView() && fen.split(' ')[0] === START_PLACEMENT && fen.split(' ')[5] === '1') {
+        if (!firstMoveChoice) {
+          let previous = '';
+          try { previous = localStorage.getItem('maia-last-opening') || ''; }
+          catch { /* Private browsing may disable storage. */ }
+          const choices = OPENING_MOVES.filter(uci => uci !== previous && candidates.some(move => move.uci === uci));
+          if (choices.length) {
+            firstMoveChoice = choices[Math.floor(Math.random() * choices.length)];
+            try { localStorage.setItem('maia-last-opening', firstMoveChoice); }
+            catch { /* Keep the choice for this game in memory. */ }
+          }
+        }
+        best = candidates.find(move => move.uci === firstMoveChoice) || best;
+      }
       shownMoves = [{uci: best.uci, percent: 100 * Math.exp(best.logit - max) / sum}];
       movesEl.replaceChildren();
       const li = document.createElement('li');
@@ -786,7 +872,7 @@
       movesEl.appendChild(li);
       drawArrows();
       showValue(output.logits_value?.data, black);
-      setStatus(`Maia ${elo} · ${black ? 'Black' : 'White'} to move`);
+      setStatus(`Maia 79M · ${backend} · ${black ? 'Black' : 'White'} to move`);
     } catch (error) {
       if (myId !== inferenceId) return;
       lastFen = '';
@@ -795,11 +881,6 @@
     }
   }
 
-  eloEl.addEventListener('change', () => {
-    elo = Number(eloEl.value);
-    lastFen = '';
-    scan();
-  });
   panel.querySelector('#maia-web-retry').addEventListener('click', loadModel);
   panel.querySelector('#maia-web-rescan').addEventListener('click', () => {
     game = null; lastBoard = ''; clearPrediction(); scan();
