@@ -1,65 +1,51 @@
 // ==UserScript==
-// @name         Maia 3 Chess Board Assistant
+// @name         Stockfish 19 Chess Board Assistant
 // @namespace    https://github.com/Jbsroboticsandautomationengineerstudent/Chess-study-training
-// @version      0.9.0
-// @description  Local Maia ONNX move probabilities on Chess.com boards
+// @version      1.0.0
+// @description  Stockfish 19 WASM analysis on Chess.com boards
 // @match        https://www.chess.com/*
 // @match        https://chess.com/*
 // @run-at       document-idle
 // @inject-into  content
 // @require      https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js
-// @require      https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/ort.webgpu.min.js
-// @connect      huggingface.co
-// @connect      cas-bridge.xethub.hf.co
-// @connect      cdn-lfs.hf.co
+// @connect      unpkg.com
 // @grant        GM_xmlhttpRequest
 // ==/UserScript==
 
-/*
- * Model contract (the 79M ONNX model is fetched from Hugging Face):
- *   tokens      float32 [1,64,96]
- *   self_elo    int32 or int64 [1]
- *   oppo_elo    int32 or int64 [1]
- *   logits_move float32 [1,4352] (move_logits is also accepted)
- *   logits_value float32 [1,3] (loss, draw, win for the side to move)
- * The token and move-index mappings mirror maia.mm. A stock Maia .pt checkpoint
- * or CoreML .mlpackage cannot be renamed to .onnx; export a compatible model.
- */
 (async () => {
   'use strict';
 
   if (window.top !== window || document.getElementById('maia-web-panel')) return;
-  const MODEL_URL = 'https://huggingface.co/cstr/maia3-onnx-int32/resolve/main/maia3_79m_int32.onnx';
-  const MODEL_BYTES = 313204242;
-  const ORT_DIST = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/';
+  const ENGINE_BASE = 'https://unpkg.com/stockfish@19.0.1/bin/';
+  const ENGINE_SCRIPT = `${ENGINE_BASE}stockfish-19-single.js`;
+  const ENGINE_WASM = `${ENGINE_BASE}stockfish-19-single.wasm`;
   const ChessClass = typeof Chess !== 'undefined' ? Chess : window.Chess;
-  const ortApi = typeof ort !== 'undefined' ? ort : window.ort;
-  if (!ChessClass || !ortApi) {
-    console.error('[Maia] chess.js or onnxruntime-web did not load. Check the userscript manager and CDN access.');
+  if (!ChessClass) {
+    console.error('[Stockfish 19] chess.js did not load. Check the userscript manager and CDN access.');
     return;
   }
 
-  const ELO = 2700;
-  const OPENING_MOVES = ['e2e4', 'd2d4', 'c2c4', 'g1f3'];
   const START_PLACEMENT = new ChessClass().fen().split(' ')[0];
   let board = null;
   let game = null;
-  let session = null;
-  let modelPromise = null;
-  let modelError = '';
-  let backend = '';
+  let worker = null;
+  let workerUrl = '';
+  let wasmBlobUrl = '';
+  let engineReady = false;
+  let engineStarting = false;
+  let engineError = '';
+  let depth = 18;
+  let activeSearch = null;
+  let pendingSearch = null;
   let openingName = '';
-  let firstMoveChoice = '';
   let lastFen = '';
   let lastBoard = '';
   let missedBoard = '';
   let missedCount = 0;
-  let inferenceId = 0;
   let scanTimer = 0;
   let flipOverride = false;
   let shownMoves = [];
   let shownValue = null;
-  let shownLogitsValue = null;
   let streamerMode = false;
   let streamPopup = null;
   let streamChannel = null;
@@ -84,12 +70,11 @@
     #maia-web-panel .row{display:flex;align-items:center;gap:7px;margin-bottom:7px}
     #maia-web-panel select,#maia-web-panel input,#maia-web-panel button{
       color:#fff;background:#33485d;border:1px solid #708296;border-radius:5px;padding:4px 6px;font:inherit}
-    #maia-web-panel select{flex:1} #maia-web-panel button{cursor:pointer}
+    #maia-web-panel button{cursor:pointer}
+    #maia-web-depth{width:auto;min-width:0;flex:1;accent-color:#24dc83}
+    #maia-web-depth-label{min-width:25px;text-align:right;font-variant-numeric:tabular-nums}
     #maia-web-panel input{width:100%;font:11px/1.4 ui-monospace,monospace}
     #maia-web-status{color:#c6d5e4;min-height:32px;margin:5px 0;white-space:pre-wrap}
-    #maia-web-progress{height:7px;margin:5px 0 8px;background:#33485d;border-radius:5px;overflow:hidden}
-    #maia-web-progress[hidden]{display:none}
-    #maia-web-progress-fill{height:100%;width:0;background:#24dc83;transition:width .15s}
     #maia-web-opening{color:#a9dbc2;font-size:12px;min-height:18px;margin:3px 0}
     #maia-web-moves{margin:6px 0 8px;padding-left:21px;font:14px/1.6 ui-monospace,monospace}
     #maia-web-fen{overflow-wrap:anywhere;color:#a9b9c9;font:10px/1.3 ui-monospace,monospace}
@@ -106,16 +91,16 @@
   const panel = document.createElement('div');
   panel.id = 'maia-web-panel';
   panel.innerHTML = `
-    <div id="maia-web-head"><span>Maia 79M (Max Strength)</span><span>drag</span></div>
+    <div id="maia-web-head"><span>Stockfish 19</span><span>drag</span></div>
     <div class="body">
+      <div class="row"><label for="maia-web-depth">Depth</label><input id="maia-web-depth" type="range" min="10" max="25" value="18"><span id="maia-web-depth-label">18</span></div>
       <div class="row"><button id="maia-web-flip" title="Reverse arrow orientation">Flip</button></div>
       <div id="maia-web-status">Finding board…</div>
-      <div id="maia-web-progress" role="progressbar" aria-label="Model download" aria-valuemin="0" aria-valuemax="100" hidden><div id="maia-web-progress-fill"></div></div>
       <div id="maia-web-opening">Opening: —</div>
       <ol id="maia-web-moves"></ol>
       <div id="maia-web-value"><div id="maia-web-value-label"><span>White win —</span><span>Draw —</span><span>Black win —</span></div>
-        <div id="maia-web-value-bar" role="img" aria-label="Win probabilities"><span id="maia-web-white"></span><span id="maia-web-draw"></span><span id="maia-web-black"></span></div></div>
-      <div class="row"><button id="maia-web-retry">Load model</button>
+        <div id="maia-web-value-bar" role="img" aria-label="Estimated win probabilities"><span id="maia-web-white"></span><span id="maia-web-draw"></span><span id="maia-web-black"></span></div></div>
+      <div class="row"><button id="maia-web-retry">Retry engine</button>
         <button id="maia-web-rescan">Rescan board</button></div>
       <div class="row"><button id="maia-web-streamer">Streamer Mode: OFF</button></div>
       <div class="row"><input id="maia-web-paste" placeholder="Paste full FEN if joining midgame" aria-label="Full FEN"></div>
@@ -124,8 +109,8 @@
     </div>`;
   document.documentElement.appendChild(panel);
   const statusEl = panel.querySelector('#maia-web-status');
-  const progressEl = panel.querySelector('#maia-web-progress');
-  const progressFillEl = panel.querySelector('#maia-web-progress-fill');
+  const depthEl = panel.querySelector('#maia-web-depth');
+  const depthLabelEl = panel.querySelector('#maia-web-depth-label');
   const openingEl = panel.querySelector('#maia-web-opening');
   const movesEl = panel.querySelector('#maia-web-moves');
   const fenEl = panel.querySelector('#maia-web-fen');
@@ -146,12 +131,15 @@
     }
   }
   function clearPrediction() {
-    inferenceId++;
+    if (activeSearch && worker) {
+      activeSearch.stale = true;
+      worker.postMessage('stop');
+    }
+    pendingSearch = null;
     lastFen = '';
     movesEl.replaceChildren();
     shownMoves = [];
     shownValue = null;
-    shownLogitsValue = null;
     valueLabels.forEach((label, index) => { label.textContent = `${['White win', 'Draw', 'Black win'][index]} —`; });
     valueSegments.forEach(segment => { segment.style.width = '0%'; });
     arrow.replaceChildren();
@@ -204,7 +192,7 @@
     label.setAttribute('stroke', '#10251b');
     label.setAttribute('stroke-width', '0.8');
     label.setAttribute('paint-order', 'stroke');
-    label.textContent = `${move.percent.toFixed(1)}%`;
+    label.textContent = move.label || '';
     svg.appendChild(label);
     return true;
   }
@@ -514,17 +502,15 @@
     }
     const found = findBoard();
     if (found !== board) {
-      if (found && found !== board && lastBoard === START_PLACEMENT) firstMoveChoice = '';
       board = found;
       if (board && shownMoves.length) drawArrows();
       else arrow.style.display = 'none';
     }
-    if (!board) { setStatus('Scanning Chess.com for a board…'); return; }
+    if (!board) { if (!engineStarting) setStatus('Scanning Chess.com for a board…'); return; }
     lastBoardOrientation = isBlackView();
     const directFen = boardFen(board);
     const placement = directFen?.fen().split(' ')[0] || piecesFrom(board);
-    if (!placement) { setStatus('Board found. Waiting for position data…'); return; }
-    if (placement === START_PLACEMENT && lastBoard !== START_PLACEMENT) firstMoveChoice = '';
+    if (!placement) { if (!engineStarting) setStatus('Board found. Waiting for position data…'); return; }
     const fromSite = (directFen?.fen().split(' ')[0] === placement ? directFen : null) || siteFen(placement);
     if (placement !== lastBoard || !game || (fromSite && fromSite.fen() !== game.fen())) {
       let next = fromSite;
@@ -551,8 +537,8 @@
     if (!game) return;
     const fen = game.fen();
     if (fenEl.textContent !== fen) fenEl.textContent = fen;
-    if (session) void predict(fen);
-    else if (!modelPromise) setStatus(modelError || 'Board ready. Load a compatible Maia ONNX model.');
+    if (engineReady) requestAnalysis(fen);
+    else if (engineError) setStatus(engineError);
     keepArrowAligned();
     publishStreamState();
   }
@@ -561,200 +547,199 @@
     scanTimer = setTimeout(scan, 60);
   }
 
-  function updateDownloadProgress(loaded, total = MODEL_BYTES) {
-    const percent = Math.min(100, Math.floor(100 * loaded / (total || MODEL_BYTES)));
-    progressEl.hidden = false;
-    progressEl.setAttribute('aria-valuenow', String(percent));
-    progressFillEl.style.width = `${percent}%`;
-    setStatus(`Downloading Maia 79M: ${percent}% (${(loaded / 1e6).toFixed(0)} MB)`);
+  function beginSearch() {
+    if (!engineReady || activeSearch || !pendingSearch || !worker) return;
+    activeSearch = {...pendingSearch, stale: false, evaluation: null, reachedDepth: 0};
+    pendingSearch = null;
+    worker.postMessage(`position fen ${activeSearch.fen}`);
+    worker.postMessage(`go depth ${activeSearch.depth}`);
+    setStatus(`Stockfish 19 · analyzing depth ${activeSearch.depth}…`);
   }
-  async function downloadModel(url) {
-    if (typeof GM_xmlhttpRequest === 'function') {
-      try {
-        return await new Promise((resolve, reject) => GM_xmlhttpRequest({
-          method: 'GET', url, responseType: 'arraybuffer',
-          onprogress: e => updateDownloadProgress(e.loaded, e.lengthComputable ? e.total : MODEL_BYTES),
-          onload: r => {
-            if (r.status !== 200) { reject(new Error(`Model HTTP ${r.status}`)); return; }
-            updateDownloadProgress(r.response?.byteLength || MODEL_BYTES);
-            resolve(r.response);
-          },
-          onerror: () => reject(new Error('Model download failed'))
-        }));
-      } catch (error) { console.warn('[Maia] Userscript download failed, trying browser fetch:', error); }
+  function requestAnalysis(fen) {
+    if (!engineReady || !game || fen === lastFen) return;
+    if (!game.moves().length) {
+      lastFen = fen;
+      setStatus('No legal moves in this position.');
+      return;
     }
-    const response = await fetch(url);
-    if (!response.ok) throw new Error(`Model HTTP ${response.status}`);
-    if (!response.body) {
-      const bytes = await response.arrayBuffer();
-      updateDownloadProgress(bytes.byteLength);
-      return bytes;
+    lastFen = fen;
+    pendingSearch = {fen, depth};
+    if (activeSearch) {
+      if (!activeSearch.stale) {
+        activeSearch.stale = true;
+        worker.postMessage('stop');
+      }
+    } else beginSearch();
+  }
+  function engineLine(line) {
+    if (line === 'uciok') {
+      worker.postMessage('setoption name Hash value 32');
+      worker.postMessage('setoption name MultiPV value 1');
+      worker.postMessage('setoption name UCI_ShowWDL value true');
+      worker.postMessage('isready');
+      return;
     }
-    const total = Number(response.headers.get('Content-Length')) || MODEL_BYTES;
-    const bytes = new Uint8Array(total);
-    const reader = response.body.getReader();
-    let received = 0;
-    for (;;) {
-      const {done, value} = await reader.read();
-      if (done) break;
-      if (received + value.byteLength > bytes.byteLength) throw new Error('Model download exceeded expected size');
-      bytes.set(value, received);
-      received += value.byteLength;
-      updateDownloadProgress(received, total);
-    }
-    return received === bytes.byteLength ? bytes.buffer : bytes.buffer.slice(0, received);
-  }
-  function modelCache() {
-    return new Promise((resolve, reject) => {
-      if (!window.indexedDB) { reject(new Error('IndexedDB unavailable')); return; }
-      const request = indexedDB.open('maia-onnx-cache', 1);
-      request.onupgradeneeded = () => request.result.createObjectStore('models');
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error || new Error('IndexedDB open failed'));
-    });
-  }
-  async function cachedModelBytes() {
-    const db = await modelCache();
-    try {
-      const blob = await new Promise((resolve, reject) => {
-        const request = db.transaction('models', 'readonly').objectStore('models').get(MODEL_URL);
-        request.onsuccess = () => resolve(request.result);
-        request.onerror = () => reject(request.error);
-      });
-      return blob instanceof Blob ? blob.arrayBuffer() : null;
-    } finally { db.close(); }
-  }
-  async function cacheModelBytes(bytes) {
-    const db = await modelCache();
-    try {
-      await new Promise((resolve, reject) => {
-        const transaction = db.transaction('models', 'readwrite');
-        transaction.objectStore('models').put(new Blob([bytes]), MODEL_URL);
-        transaction.oncomplete = resolve;
-        transaction.onerror = () => reject(transaction.error);
-        transaction.onabort = () => reject(transaction.error);
-      });
-    } finally { db.close(); }
-  }
-  async function loadModel() {
-    if (modelPromise) return modelPromise;
-    modelError = '';
-    setStatus('Loading Maia 79M model…');
-    modelPromise = (async () => {
-      ortApi.env.wasm.wasmPaths = ORT_DIST;
-      ortApi.env.wasm.numThreads = 1; // Safari does not always permit threaded WASM.
-      let bytes;
-      try { bytes = await cachedModelBytes(); }
-      catch (error) { console.warn('[Maia] Cache read failed:', error); }
-      if (bytes && bytes.byteLength < 300_000_000) bytes = null;
-      if (bytes) setStatus('Loading cached Maia 79M model…');
-      else {
-        updateDownloadProgress(0);
-        bytes = await downloadModel(MODEL_URL);
-        if (!(bytes instanceof ArrayBuffer) || bytes.byteLength < 300_000_000)
-          throw new Error('Maia 79M download is incomplete');
-        try { await cacheModelBytes(bytes); }
-        catch (error) { console.warn('[Maia] Model cache unavailable:', error); }
-      }
-      if (navigator.gpu) {
-        try {
-          setStatus('Initializing Maia 79M on WebGPU…');
-          session = await ortApi.InferenceSession.create(bytes, {executionProviders: ['webgpu', 'wasm']});
-          backend = 'WebGPU';
-        } catch (error) {
-          console.warn('[Maia] WebGPU unavailable for this model:', error);
-        }
-      }
-      if (!session) {
-        setStatus('Initializing Maia 79M on CPU…');
-        session = await ortApi.InferenceSession.create(bytes, {executionProviders: ['wasm']});
-        backend = 'CPU';
-      }
-      for (const name of ['tokens', 'self_elo', 'oppo_elo']) {
-        if (!session.inputNames.includes(name)) throw new Error(`ONNX input '${name}' missing`);
-      }
-      if (!session.outputNames.some(name => name === 'logits_move' || name === 'move_logits'))
-        throw new Error("ONNX output 'logits_move' or 'move_logits' missing");
-      setStatus(`Maia 79M loaded on ${backend}.`);
-      lastFen = '';
+    if (line === 'readyok') {
+      engineStarting = false;
+      engineReady = true;
+      engineError = '';
+      if (wasmBlobUrl) { URL.revokeObjectURL(wasmBlobUrl); wasmBlobUrl = ''; }
+      setStatus('Stockfish 19 ready. Scanning board…');
       scan();
-      const placement = board && (boardFen(board)?.fen().split(' ')[0] || piecesFrom(board));
-      if (game && placement === game.fen().split(' ')[0]) void predict(game.fen());
-    })().catch(error => {
-      session = null;
-      modelError = `Model unavailable: ${error.message}`;
-      setStatus(modelError);
-    }).finally(() => { modelPromise = null; progressEl.hidden = true; });
-    return modelPromise;
+      return;
+    }
+    if (line.startsWith('info ') && activeSearch && !activeSearch.stale && game?.fen() === activeSearch.fen) {
+      const score = /\bscore (cp|mate) (-?\d+)/.exec(line);
+      if (!score || /\b(?:upperbound|lowerbound)\b/.test(line)) return;
+      const wdl = /\bwdl (\d+) (\d+) (\d+)/.exec(line);
+      const foundDepth = /\bdepth (\d+)/.exec(line);
+      const reachedDepth = foundDepth ? Number(foundDepth[1]) : 0;
+      if (reachedDepth < activeSearch.reachedDepth) return;
+      activeSearch.reachedDepth = reachedDepth;
+      activeSearch.evaluation = {
+        cp: score[1] === 'cp' ? Number(score[2]) : null,
+        mate: score[1] === 'mate' ? Number(score[2]) : null,
+        wdl: wdl ? wdl.slice(1).map(Number) : null
+      };
+      showValue(activeSearch.evaluation, game.turn() === 'b');
+      setStatus(`Stockfish 19 · depth ${reachedDepth}/${activeSearch.depth} · ${game.turn() === 'b' ? 'Black' : 'White'} to move`);
+      publishStreamState();
+      return;
+    }
+    if (!line.startsWith('bestmove ') || !activeSearch) return;
+    const finished = activeSearch;
+    activeSearch = null;
+    if (!finished.stale && !pendingSearch && game?.fen() === finished.fen) {
+      const best = /^bestmove ([a-h][1-8][a-h][1-8][qrbn]?)/.exec(line)?.[1];
+      const legal = game.moves({verbose: true}).some(move =>
+        `${move.from}${move.to}${move.promotion || ''}` === best);
+      if (best && legal) {
+        shownMoves = [{uci: best, label: ''}];
+        movesEl.replaceChildren();
+        const item = document.createElement('li');
+        item.textContent = best;
+        movesEl.appendChild(item);
+        showValue(finished.evaluation, game.turn() === 'b');
+        drawArrows();
+        setStatus(`Stockfish 19 · depth ${finished.reachedDepth || finished.depth} · ${game.turn() === 'b' ? 'Black' : 'White'} to move`);
+      } else {
+        clearPrediction();
+        setStatus(best === undefined ? 'No legal moves.' : 'Stockfish returned an invalid move. Rescanning…');
+      }
+      publishStreamState();
+    }
+    beginSearch();
+  }
+  function downloadAsset(url, onProgress) {
+    if (typeof GM_xmlhttpRequest !== 'function') {
+      return fetch(url).then(response => {
+        if (!response.ok) throw new Error(`HTTP ${response.status} while downloading ${url}`);
+        return response.blob();
+      });
+    }
+    return new Promise((resolve, reject) => GM_xmlhttpRequest({
+      method: 'GET', url, responseType: 'blob',
+      onprogress: event => onProgress?.(event.loaded, event.total),
+      onload: response => response.status >= 200 && response.status < 300 && response.response
+        ? resolve(response.response)
+        : reject(new Error(`HTTP ${response.status} while downloading ${url}`)),
+      onerror: () => reject(new Error(`Network error while downloading ${url}`)),
+      ontimeout: () => reject(new Error(`Timed out while downloading ${url}`))
+    }));
+  }
+  async function startEngine() {
+    if (engineStarting || engineReady) return;
+    if (worker) worker.terminate();
+    if (workerUrl) URL.revokeObjectURL(workerUrl);
+    if (wasmBlobUrl) URL.revokeObjectURL(wasmBlobUrl);
+    worker = null;
+    workerUrl = wasmBlobUrl = '';
+    engineReady = false;
+    engineStarting = true;
+    engineError = '';
+    activeSearch = pendingSearch = null;
+    lastFen = '';
+    setStatus('Loading Stockfish 19 WASM (about 94 MB)…');
+    try {
+      const scriptBlob = await downloadAsset(ENGINE_SCRIPT);
+      const wasmBlob = await downloadAsset(ENGINE_WASM, (loaded, total) => {
+        const progress = total ? `${Math.floor(100 * loaded / total)}%` : `${(loaded / 1e6).toFixed(0)} MB`;
+        setStatus(`Downloading Stockfish 19 WASM: ${progress}`);
+      });
+      workerUrl = URL.createObjectURL(new Blob([scriptBlob], {type: 'text/javascript'}));
+      wasmBlobUrl = URL.createObjectURL(new Blob([wasmBlob], {type: 'application/wasm'}));
+      // The Stockfish worker accepts a WASM URL in its own URL fragment.
+      worker = new Worker(`${workerUrl}#${encodeURIComponent(wasmBlobUrl)}`);
+      worker.onmessage = event => {
+        for (const line of String(event.data).split(/\r?\n/)) {
+          if (line === 'info WillOutputEngineDownloadProgress') {
+            const channel = new MessageChannel();
+            channel.port1.onmessage = progress => {
+              if (engineReady) { channel.port1.close(); return; }
+              const percent = Math.min(100, Math.round(100 * (progress.data?.percent || 0)));
+              setStatus(`Loading Stockfish 19 WASM: ${percent}%`);
+              if (percent >= 100) channel.port1.close();
+            };
+            worker.postMessage({progressPort: channel.port2}, [channel.port2]);
+          } else if (line) engineLine(line.trim());
+        }
+      };
+      worker.onerror = event => {
+        engineStarting = engineReady = false;
+        engineError = `Stockfish 19 failed to load: ${event.message || 'worker error'}`;
+        setStatus(engineError);
+        worker?.terminate();
+        worker = null;
+        if (workerUrl) URL.revokeObjectURL(workerUrl);
+        if (wasmBlobUrl) URL.revokeObjectURL(wasmBlobUrl);
+        workerUrl = wasmBlobUrl = '';
+      };
+      worker.postMessage('setoption name CanOutputEngineDownloadProgress');
+      worker.postMessage('uci');
+    } catch (error) {
+      engineStarting = engineReady = false;
+      engineError = `Stockfish 19 failed to start: ${error.message}`;
+      setStatus(engineError);
+      if (workerUrl) URL.revokeObjectURL(workerUrl);
+      if (wasmBlobUrl) URL.revokeObjectURL(wasmBlobUrl);
+      workerUrl = wasmBlobUrl = '';
+    }
   }
 
-  function boardTokens(fen) {
-    const result = new Float32Array(64 * 96);
-    const [placement, side] = fen.split(' ');
-    const ranks = placement.split('/');
-    const channel = {p: 0, n: 1, b: 2, r: 3, q: 4, k: 5};
-    for (let row = 0; row < 8; row++) {
-      let file = 0;
-      for (const c of ranks[row]) {
-        if (/^[1-8]$/.test(c)) { file += Number(c); continue; }
-        const rank = 7 - row;
-        const sq = rank * 8 + file++;
-        const blackPiece = c === c.toLowerCase();
-        const mappedSq = side === 'b' ? sq ^ 56 : sq;
-        const mappedBlack = side === 'b' ? !blackPiece : blackPiece;
-        const ch = channel[c.toLowerCase()] + (mappedBlack ? 6 : 0);
-        for (let repeat = 0; repeat < 8; repeat++) result[mappedSq * 96 + repeat * 12 + ch] = 1;
-      }
-    }
-    return result;
-  }
-  function mirrorSquare(square) { return `${square[0]}${9 - Number(square[1])}`; }
-  function moveIndex(move, black) {
-    const from = black ? mirrorSquare(move.from) : move.from;
-    const to = black ? mirrorSquare(move.to) : move.to;
-    const ff = from.charCodeAt(0) - 97, fr = Number(from[1]) - 1;
-    const tf = to.charCodeAt(0) - 97, tr = Number(to[1]) - 1;
-    if (move.promotion) {
-      const pi = 'qrbn'.indexOf(move.promotion);
-      if (pi < 0 || fr !== 6 || tr !== 7) return -1;
-      return 4096 + ff * 32 + tf * 4 + pi;
-    }
-    return (fr * 8 + ff) * 64 + (tr * 8 + tf);
-  }
-  function eloTensor(name) {
-    const inputIndex = session.inputNames.indexOf(name);
-    const type = session.inputMetadata?.[inputIndex]?.type || 'tensor(int32)';
-    if (type === 'int64' || type === 'tensor(int64)')
-      return new ortApi.Tensor('int64', BigInt64Array.of(BigInt(ELO)), [1]);
-    if (type === 'int32' || type === 'tensor(int32)')
-      return new ortApi.Tensor('int32', Int32Array.of(ELO), [1]);
-    throw new Error(`${name} must be int32 or int64, got ${type}`);
-  }
-  function showValue(logits, blackToMove) {
-    shownLogitsValue = logits ? Array.from(logits) : null;
-    if (!logits || logits.length !== 3 || !Array.from(logits).every(Number.isFinite)) {
+  function showValue(evaluation, blackToMove) {
+    if (!evaluation) {
       shownValue = null;
       valueLabels.forEach((label, index) => { label.textContent = `${['White win', 'Draw', 'Black win'][index]} —`; });
       valueSegments.forEach(segment => { segment.style.width = '0%'; });
       return;
     }
-    const max = Math.max(...logits);
-    const weights = Array.from(logits, value => Math.exp(value - max));
-    const total = weights.reduce((a, b) => a + b, 0);
-    const [loss, draw, win] = weights.map(value => 100 * value / total);
+    let win, draw, loss;
+    const total = evaluation.wdl?.reduce((sum, value) => sum + value, 0) || 0;
+    if (total > 0) {
+      [win, draw, loss] = evaluation.wdl.map(value => 100 * value / total);
+    } else if (evaluation.mate !== null) {
+      [win, draw, loss] = evaluation.mate > 0 ? [100, 0, 0] : [0, 0, 100];
+    } else {
+      // Fallback only: centipawns do not determine exact win/draw/loss odds.
+      const expected = 1 / (1 + Math.exp(-evaluation.cp / 180));
+      draw = 28 * Math.exp(-Math.abs(evaluation.cp) / 250);
+      win = (100 - draw) * expected;
+      loss = 100 - draw - win;
+    }
     const percentages = blackToMove ? [loss, draw, win] : [win, draw, loss];
     shownValue = percentages;
-    valueLabels.forEach((label, index) => { label.textContent = `${['White win', 'Draw', 'Black win'][index]} ${percentages[index].toFixed(1)}%`; });
+    const prefix = total > 0 ? '' : '~';
+    valueLabels.forEach((label, index) => { label.textContent = `${['White win', 'Draw', 'Black win'][index]} ${prefix}${percentages[index].toFixed(1)}%`; });
     valueSegments.forEach((segment, index) => { segment.style.width = `${percentages[index]}%`; });
-    panel.querySelector('#maia-web-value-bar').setAttribute('aria-label', `White win ${percentages[0].toFixed(1)}%, draw ${percentages[1].toFixed(1)}%, black win ${percentages[2].toFixed(1)}%`);
+    panel.querySelector('#maia-web-value-bar').setAttribute('aria-label', `Estimated: white win ${percentages[0].toFixed(1)}%, draw ${percentages[1].toFixed(1)}%, black win ${percentages[2].toFixed(1)}%`);
   }
   function publishStreamState() {
     if (!streamerMode || !streamChannel) return;
     const state = {type: 'state', status: statusEl.textContent, opening: openingName,
       fen: game?.fen() || '', blackView: board ? isBlackView() : lastBoardOrientation,
       skin: captureBoardSkin(),
-      moves: shownMoves.map(move => ({uci: move.uci, percent: move.percent})),
-      logits_value: shownLogitsValue, value: shownValue ? [...shownValue] : null};
+      depth, moves: shownMoves.map(move => ({uci: move.uci, label: move.label})),
+      value: shownValue ? [...shownValue] : null};
     const signature = JSON.stringify(state);
     if (signature === lastStreamSignature) return;
     lastStreamSignature = signature;
@@ -763,7 +748,7 @@
   function stopStreamerMode() {
     if (!streamerMode) return;
     streamerMode = false;
-    try { localStorage.setItem('maia-streamer-active', 'false'); }
+    try { localStorage.setItem('stockfish-streamer-active', 'false'); }
     catch { /* Private browsing may disable storage. */ }
     lastStreamSignature = '';
     try { streamChannel?.close(); popupChannel?.close(); }
@@ -782,11 +767,11 @@
       setStatus('This browser does not support BroadcastChannel.');
       return;
     }
-    const popup = window.open('', 'maia-streamer-popup', 'popup,width=340,height=640');
+    const popup = window.open('', 'stockfish-streamer-popup', 'popup,width=340,height=640');
     if (!popup) { setStatus('Allow popups for Chess.com, then try Streamer Mode again.'); return; }
     try {
       popup.document.open();
-      popup.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>Maia 79M Streamer View</title>
+      popup.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>Stockfish 19 Streamer View</title>
         <style>body{margin:0;background:#121c28;color:#f6f8fb;font:14px/1.5 system-ui,-apple-system,sans-serif}
         main{padding:16px}h1{margin:0 0 14px;font-size:18px}.row{display:flex;align-items:center;gap:8px;margin:10px 0}
         button{background:#33485d;color:#fff;border:1px solid #708296;border-radius:6px;padding:7px;font:inherit;cursor:pointer}
@@ -802,8 +787,8 @@
         #mini-board .white-piece{color:#fff;text-shadow:0 1px 2px #111,1px 0 #111,-1px 0 #111}
         #mini-board .black-piece{color:#182018;text-shadow:0 1px 1px #fff9}
         #mini-arrow{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible}
-        </style></head><body><main><h1>Maia 79M (Max Strength)</h1><div id="status">Connecting…</div>
-        <div id="opening">Opening: —</div><div id="mini-board" aria-label="Current chess position"><svg id="mini-arrow" viewBox="0 0 100 100" aria-hidden="true"></svg></div>
+        </style></head><body><main><h1>Stockfish 19</h1><div id="status">Connecting…</div>
+        <div id="depth">Depth: 18</div><div id="opening">Opening: —</div><div id="mini-board" aria-label="Current chess position"><svg id="mini-arrow" viewBox="0 0 100 100" aria-hidden="true"></svg></div>
         <ol id="moves"></ol><div id="labels"><span>White win —</span><span>Draw —</span><span>Black win —</span></div>
         <div id="bar"><span id="white"></span><span id="draw"></span><span id="black"></span></div>
         <div class="row"><button id="off">Streamer Mode: ON · Turn off</button></div></main></body></html>`);
@@ -816,7 +801,7 @@
         cell.appendChild(popup.document.createElement('span'));
         miniBoard.insertBefore(cell, miniArrow);
       }
-      const channelName = `maia-streamer-${crypto.randomUUID?.() || Date.now()}`;
+      const channelName = `stockfish-streamer-${crypto.randomUUID?.() || Date.now()}`;
       streamChannel = new BroadcastChannel(channelName);
       popupChannel = new popup.BroadcastChannel(channelName);
       streamChannel.onmessage = event => {
@@ -826,13 +811,14 @@
         if (event.data?.type !== 'state' || popup.closed) return;
         const state = event.data;
         popup.document.getElementById('status').textContent = state.status;
+        popup.document.getElementById('depth').textContent = `Depth: ${state.depth}`;
         popup.document.getElementById('opening').textContent = `Opening: ${state.opening || '—'}`;
         renderMiniBoard(popup.document, state.fen, state.blackView, state.moves[0], state.skin);
         const list = popup.document.getElementById('moves');
         list.replaceChildren();
         for (const move of state.moves.slice(0, 1)) {
           const item = popup.document.createElement('li');
-          item.textContent = `${move.uci} (${move.percent.toFixed(1)}%)`;
+          item.textContent = move.uci;
           list.appendChild(item);
         }
         const labels = popup.document.querySelectorAll('#labels span');
@@ -845,7 +831,7 @@
       popup.document.getElementById('off').addEventListener('click', () => popupChannel.postMessage({type: 'off'}));
       streamPopup = popup;
       streamerMode = true;
-      try { localStorage.setItem('maia-streamer-active', 'true'); }
+      try { localStorage.setItem('stockfish-streamer-active', 'true'); }
       catch { /* Private browsing may disable storage. */ }
       arrow.replaceChildren();
       arrow.style.display = 'none';
@@ -864,63 +850,14 @@
       setStatus(`Streamer Mode failed: ${error.message}`);
     }
   }
-  async function predict(fen) {
-    if (!session || !game || fen === lastFen) return;
-    lastFen = fen;
-    const myId = ++inferenceId;
-    setStatus('Maia is evaluating…');
-    try {
-      const legal = game.moves({verbose: true});
-      if (!legal.length) { setStatus('No legal moves.'); return; }
-      const feeds = {
-        tokens: new ortApi.Tensor('float32', boardTokens(fen), [1, 64, 96]),
-        self_elo: eloTensor('self_elo'), oppo_elo: eloTensor('oppo_elo')
-      };
-      const output = await session.run(feeds);
-      if (myId !== inferenceId) return;
-      const logits = (output.logits_move || output.move_logits)?.data;
-      if (!logits || logits.length < 4352) throw new Error('Move logits must contain 4352 values');
-      const black = game.turn() === 'b';
-      const candidates = legal.map(move => {
-        const index = moveIndex(move, black);
-        return {uci: `${move.from}${move.to}${move.promotion || ''}`, logit: index < 0 ? NaN : Number(logits[index])};
-      }).filter(x => Number.isFinite(x.logit));
-      if (!candidates.length) throw new Error('No legal moves mapped to model logits');
-      const max = Math.max(...candidates.map(x => x.logit));
-      const sum = candidates.reduce((acc, x) => acc + Math.exp(x.logit - max), 0);
-      candidates.sort((a, b) => b.logit - a.logit);
-      let best = candidates[0];
-      if (!black && !isBlackView() && fen.split(' ')[0] === START_PLACEMENT && fen.split(' ')[5] === '1') {
-        if (!firstMoveChoice) {
-          let previous = '';
-          try { previous = localStorage.getItem('maia-last-opening') || ''; }
-          catch { /* Private browsing may disable storage. */ }
-          const choices = OPENING_MOVES.filter(uci => uci !== previous && candidates.some(move => move.uci === uci));
-          if (choices.length) {
-            firstMoveChoice = choices[Math.floor(Math.random() * choices.length)];
-            try { localStorage.setItem('maia-last-opening', firstMoveChoice); }
-            catch { /* Keep the choice for this game in memory. */ }
-          }
-        }
-        best = candidates.find(move => move.uci === firstMoveChoice) || best;
-      }
-      shownMoves = [{uci: best.uci, percent: 100 * Math.exp(best.logit - max) / sum}];
-      movesEl.replaceChildren();
-      const li = document.createElement('li');
-      li.textContent = `${best.uci} (${shownMoves[0].percent.toFixed(1)}%)`;
-      movesEl.appendChild(li);
-      drawArrows();
-      showValue(output.logits_value?.data, black);
-      setStatus(`Maia 79M · ${backend} · ${black ? 'Black' : 'White'} to move`);
-    } catch (error) {
-      if (myId !== inferenceId) return;
-      lastFen = '';
-      clearPrediction();
-      setStatus(`Inference failed: ${error.message}`);
-    }
-  }
-
-  panel.querySelector('#maia-web-retry').addEventListener('click', loadModel);
+  panel.querySelector('#maia-web-retry').addEventListener('click', startEngine);
+  depthEl.addEventListener('input', () => {
+    depth = Math.max(10, Math.min(25, Number(depthEl.value) || 18));
+    depthLabelEl.textContent = String(depth);
+    lastFen = '';
+    if (game) requestAnalysis(game.fen());
+    publishStreamState();
+  });
   panel.querySelector('#maia-web-rescan').addEventListener('click', () => {
     game = null; lastBoard = ''; clearPrediction(); scan();
   });
@@ -973,9 +910,11 @@
   setInterval(() => { if (streamerMode && streamPopup?.closed) stopStreamerMode(); }, 500);
   setInterval(scan, 300);
   scan();
-  void loadModel();
+  startEngine();
   try {
-    if (localStorage.getItem('maia-streamer-active') === 'true')
+    const savedStreamerState = localStorage.getItem('stockfish-streamer-active');
+    if (savedStreamerState === 'true' ||
+        (savedStreamerState === null && localStorage.getItem('maia-streamer-active') === 'true'))
       setTimeout(startStreamerMode, 400);
   } catch { /* Keep manual mode available when storage is disabled. */ }
 })();
