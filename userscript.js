@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Stockfish 19 Chess Board Assistant
 // @namespace    https://github.com/Jbsroboticsandautomationengineerstudent/Chess-study-training
-// @version      1.0.0
-// @description  Stockfish 19 WASM analysis on Chess.com boards
+// @version      1.1.0
+// @description  Stockfish 19 WASM board analysis and post-game move research
 // @match        https://www.chess.com/*
 // @match        https://chess.com/*
 // @run-at       document-idle
@@ -19,6 +19,7 @@
   const ENGINE_BASE = 'https://unpkg.com/stockfish@19.0.1/bin/';
   const ENGINE_SCRIPT = `${ENGINE_BASE}stockfish-19-single.js`;
   const ENGINE_WASM = `${ENGINE_BASE}stockfish-19-single.wasm`;
+  const RESEARCH_DEPTH = 18;
   const ChessClass = typeof Chess !== 'undefined' ? Chess : window.Chess;
   if (!ChessClass) {
     console.error('[Stockfish 19] chess.js did not load. Check the userscript manager and CDN access.');
@@ -37,6 +38,8 @@
   let depth = 18;
   let activeSearch = null;
   let pendingSearch = null;
+  let researchJob = null;
+  let researchResult = null;
   let openingName = '';
   let lastFen = '';
   let lastBoard = '';
@@ -84,6 +87,12 @@
     #maia-web-value-bar span{height:100%;min-width:0}
     #maia-web-white{background:#f5f5ed} #maia-web-draw{background:#cfb951} #maia-web-black{background:#242b35}
     #maia-web-arrow{position:fixed;z-index:2147483645;pointer-events:none;overflow:visible}
+    #maia-web-research{margin:8px 0 0;border-top:1px solid #50657b;padding-top:8px}
+    #maia-web-research summary{cursor:pointer;font-weight:700}
+    #maia-web-research textarea{width:100%;min-height:85px;margin:7px 0;color:#fff;background:#33485d;border:1px solid #708296;border-radius:5px;font:11px/1.4 ui-monospace,monospace}
+    #maia-web-research .row input{flex:1;width:0;min-width:0}
+    #maia-web-research .row select{max-width:95px}
+    #maia-web-research-note{font-size:11px;color:#c6d5e4;white-space:pre-wrap}
     @media(max-width:600px){#maia-web-panel{top:68px;right:8px}}
   `;
   document.documentElement.appendChild(style);
@@ -106,6 +115,15 @@
       <div class="row"><input id="maia-web-paste" placeholder="Paste full FEN if joining midgame" aria-label="Full FEN"></div>
       <div class="row"><button id="maia-web-use-fen">Use FEN</button></div>
       <div id="maia-web-fen"></div>
+      <details id="maia-web-research"><summary>Post-game move research</summary>
+        <textarea id="maia-web-pgn" placeholder="Paste a completed game's PGN"></textarea>
+        <div class="row"><select id="maia-web-research-side" aria-label="Side to analyze"><option value="w">White moves</option><option value="b">Black moves</option></select>
+          <input id="maia-web-s" type="number" min="0" step="any" placeholder="Fitted s" aria-label="Fitted sensitivity s">
+          <input id="maia-web-c" type="number" min="0" step="any" placeholder="Fitted c" aria-label="Fitted consistency c"></div>
+        <div class="row"><button id="maia-web-research-run">Analyze PGN</button><button id="maia-web-research-cancel" disabled>Cancel</button></div>
+        <div class="row"><button id="maia-web-research-download" disabled>Download JSON</button></div>
+        <div id="maia-web-research-note">Fixed depth 18; every legal move. Fitted s,c are required for probabilities. E_N needs separate calibrated q and clock models.</div>
+      </details>
     </div>`;
   document.documentElement.appendChild(panel);
   const statusEl = panel.querySelector('#maia-web-status');
@@ -114,6 +132,7 @@
   const openingEl = panel.querySelector('#maia-web-opening');
   const movesEl = panel.querySelector('#maia-web-moves');
   const fenEl = panel.querySelector('#maia-web-fen');
+  const researchNoteEl = panel.querySelector('#maia-web-research-note');
   const valueLabels = panel.querySelectorAll('#maia-web-value-label span');
   const valueSegments = ['#maia-web-white', '#maia-web-draw', '#maia-web-black'].map(selector => panel.querySelector(selector));
 
@@ -537,7 +556,7 @@
     if (!game) return;
     const fen = game.fen();
     if (fenEl.textContent !== fen) fenEl.textContent = fen;
-    if (engineReady) requestAnalysis(fen);
+    if (engineReady && !researchJob) requestAnalysis(fen);
     else if (engineError) setStatus(engineError);
     keepArrowAligned();
     publishStreamState();
@@ -547,8 +566,184 @@
     scanTimer = setTimeout(scan, 60);
   }
 
+  function scaledValue(pawns) {
+    return Math.sign(pawns) * Math.log1p(Math.abs(pawns));
+  }
+  function moveLaw(values, s, c) {
+    if (!values.length || !values.every(Number.isFinite) ||
+        values.some((value, index) => index && value > values[index - 1]) ||
+        !(s > 0) || !(c > 0)) throw new Error('Sorted pawn values and positive fitted s,c are required.');
+    const losses = values.map(value => Math.max(0, scaledValue(values[0]) - scaledValue(value)));
+    const weights = losses.map(loss => Math.exp(Math.min(27, Math.pow(loss / s, c))));
+    let p = 1 / values.length;
+    let converged = values.length === 1;
+    if (!converged) {
+      for (let iteration = 0; iteration < 100; iteration++) {
+        const logP = Math.log(p);
+        let g = 0, derivative = 0;
+        for (const weight of weights) {
+          g += Math.exp(weight * logP);
+          derivative += weight * Math.exp((weight - 1) * logP);
+        }
+        if (Math.abs(g - 1) < 1e-14) { converged = true; break; }
+        const next = p - (g - 1) / derivative;
+        if (!(next > 0 && next < 1)) break;
+        p = next;
+      }
+    }
+    let u = -Math.log(p);
+    if (!converged) {
+      // Safeguard Newton in log space when the root rounds to p = 1 in double precision.
+      let low = 0, high = Math.log(values.length);
+      for (let iteration = 0; iteration < 200; iteration++) {
+        let g = 0, slope = 0;
+        for (const weight of weights) {
+          const term = Math.exp(-weight * u);
+          g += term;
+          slope += weight * term;
+        }
+        if (Math.abs(g - 1) < 1e-14) break;
+        if (g > 1) low = u; else high = u;
+        const next = u + (g - 1) / slope;
+        u = next > low && next < high ? next : (low + high) / 2;
+      }
+    }
+    const probabilities = weights.map(weight => Math.exp(-weight * u));
+    const residual = Math.abs(probabilities.reduce((sum, value) => sum + value, 0) - 1);
+    if (residual >= 1e-14) throw new Error(`Move-law normalisation residual ${residual} exceeds tolerance.`);
+    return {losses, weights, probabilities, residual};
+  }
+  function startPostgameResearch() {
+    if (researchJob) return;
+    if (!engineReady || !worker) { researchNoteEl.textContent = 'Stockfish 19 must finish loading first.'; return; }
+    const pgn = panel.querySelector('#maia-web-pgn').value.trim();
+    const side = panel.querySelector('#maia-web-research-side').value;
+    const sText = panel.querySelector('#maia-web-s').value.trim();
+    const cText = panel.querySelector('#maia-web-c').value.trim();
+    if (Boolean(sText) !== Boolean(cText)) {
+      researchNoteEl.textContent = 'Enter both fitted s and c, or leave both blank for scaled-loss export.';
+      return;
+    }
+    const s = sText ? Number(sText) : null, c = cText ? Number(cText) : null;
+    if (sText && (!(s > 0) || !(c > 0))) {
+      researchNoteEl.textContent = 'Fitted s and c must both be positive.';
+      return;
+    }
+    const parsed = new ChessClass();
+    try {
+      if (!parsed.load_pgn(pgn)) throw new Error('PGN could not be parsed.');
+      const history = parsed.history({verbose: true});
+      while (parsed.undo()) { /* Return to the PGN's starting FEN, if one was supplied. */ }
+      const replay = new ChessClass(parsed.fen());
+      const positions = [];
+      for (const move of history) {
+        if (replay.turn() === side) positions.push({
+          fen: replay.fen(), played: `${move.from}${move.to}${move.promotion || ''}`,
+          legal: replay.moves({verbose: true}).map(candidate =>
+            `${candidate.from}${candidate.to}${candidate.promotion || ''}`)
+        });
+        replay.move({from: move.from, to: move.to, promotion: move.promotion || 'q'});
+      }
+      if (!positions.length) throw new Error('PGN has no moves for the selected side.');
+      researchResult = null;
+      researchJob = {positions, results: [], index: 0, active: null, side, s, c, cancelled: false};
+      panel.querySelector('#maia-web-research-run').disabled = true;
+      panel.querySelector('#maia-web-research-cancel').disabled = false;
+      panel.querySelector('#maia-web-research-download').disabled = true;
+      pendingSearch = null;
+      lastFen = '';
+      if (activeSearch) { activeSearch.stale = true; worker.postMessage('stop'); }
+      else beginPostgamePosition();
+    } catch (error) { researchNoteEl.textContent = `Research setup failed: ${error.message}`; }
+  }
+  function beginPostgamePosition() {
+    if (!researchJob || researchJob.active || activeSearch || !worker) return;
+    if (researchJob.cancelled || researchJob.index >= researchJob.positions.length) {
+      finishPostgameResearch();
+      return;
+    }
+    const position = researchJob.positions[researchJob.index];
+    researchJob.active = {position, scores: new Map()};
+    researchNoteEl.textContent = `Stockfish 19 fixed depth ${RESEARCH_DEPTH}: position ${researchJob.index + 1}/${researchJob.positions.length}, ${position.legal.length} legal moves…`;
+    worker.postMessage(`setoption name MultiPV value ${position.legal.length}`);
+    worker.postMessage(`position fen ${position.fen}`);
+    worker.postMessage(`go depth ${RESEARCH_DEPTH}`);
+  }
+  function postgameEngineLine(line) {
+    const active = researchJob?.active;
+    if (!active) return false;
+    if (line.startsWith('info ')) {
+      if (researchJob.cancelled || /\b(?:upperbound|lowerbound)\b/.test(line)) return true;
+      const foundDepth = /\bdepth (\d+)/.exec(line);
+      const score = /\bscore (cp|mate) (-?\d+)/.exec(line);
+      const pv = /\bpv ([a-h][1-8][a-h][1-8][qrbn]?)/.exec(line);
+      if (foundDepth && score && pv && active.position.legal.includes(pv[1])) {
+        const previous = active.scores.get(pv[1]);
+        const found = {uci: pv[1], depth: Number(foundDepth[1]),
+          cp: score[1] === 'cp' ? Number(score[2]) : null,
+          mate: score[1] === 'mate' ? Number(score[2]) : null};
+        if (!previous || found.depth >= previous.depth) active.scores.set(pv[1], found);
+      }
+      return true;
+    }
+    if (!line.startsWith('bestmove ')) return false;
+    if (!researchJob.cancelled) {
+      const moves = active.position.legal.map(uci => active.scores.get(uci) || {uci, depth: 0, cp: null, mate: null});
+      const complete = moves.every(move => move.depth >= RESEARCH_DEPTH);
+      const centipawnsOnly = moves.every(move => Number.isFinite(move.cp));
+      const sorted = centipawnsOnly ? [...moves].sort((a, b) => b.cp - a.cp) : moves;
+      const result = {fen: active.position.fen, played: active.position.played,
+        legalCount: active.position.legal.length, complete, moves: sorted,
+        reason: !complete ? 'Missing full-depth evaluation for one or more moves' :
+          !centipawnsOnly ? 'Mate scores cannot be converted to pawn values without a stated rule' : null};
+      if (complete && centipawnsOnly) {
+        const pawnValues = sorted.map(move => move.cp / 100);
+        result.scaledLosses = pawnValues.map(value => scaledValue(pawnValues[0]) - scaledValue(value));
+        result.moves.forEach((move, index) => { move.delta = result.scaledLosses[index]; });
+        if (researchJob.s !== null) {
+          try {
+            const law = moveLaw(pawnValues, researchJob.s, researchJob.c);
+            result.moves.forEach((move, index) => {
+              move.weight = law.weights[index];
+              move.probability = law.probabilities[index];
+            });
+            result.normalizationResidual = law.residual;
+          } catch (error) { result.reason = `Move law unavailable: ${error.message}`; }
+        }
+      }
+      researchJob.results.push(result);
+      researchJob.index++;
+    }
+    researchJob.active = null;
+    beginPostgamePosition();
+    return true;
+  }
+  function finishPostgameResearch() {
+    if (!researchJob) return;
+    const job = researchJob;
+    researchJob = null;
+    if (worker && engineReady) worker.postMessage('setoption name MultiPV value 1');
+    panel.querySelector('#maia-web-research-run').disabled = false;
+    panel.querySelector('#maia-web-research-cancel').disabled = true;
+    if (job.cancelled) researchNoteEl.textContent = 'Post-game research cancelled.';
+    else {
+      researchResult = {
+        engine: 'stockfish@19.0.1 full single-threaded WASM', depth: RESEARCH_DEPTH,
+        multipv: 'all legal moves per position', side: job.side,
+        calibration: job.s === null ? null : {s: job.s, c: job.c, source: 'user supplied; not verified'},
+        eProcess: null,
+        eProcessReason: 'Requires fitted joint alternative q, two-regime clock density, rating corridor and held-out calibration.',
+        positions: job.results
+      };
+      panel.querySelector('#maia-web-research-download').disabled = false;
+      researchNoteEl.textContent = `Analyzed ${job.results.length} positions. Download JSON for evaluations and scaled losses. E_N unavailable without calibrated data.`;
+    }
+    lastFen = '';
+    scan();
+  }
+
   function beginSearch() {
-    if (!engineReady || activeSearch || !pendingSearch || !worker) return;
+    if (!engineReady || activeSearch || !pendingSearch || !worker || researchJob) return;
     activeSearch = {...pendingSearch, stale: false, evaluation: null, reachedDepth: 0};
     pendingSearch = null;
     worker.postMessage(`position fen ${activeSearch.fen}`);
@@ -556,7 +751,7 @@
     setStatus(`Stockfish 19 · analyzing depth ${activeSearch.depth}…`);
   }
   function requestAnalysis(fen) {
-    if (!engineReady || !game || fen === lastFen) return;
+    if (!engineReady || !game || researchJob || fen === lastFen) return;
     if (!game.moves().length) {
       lastFen = fen;
       setStatus('No legal moves in this position.');
@@ -588,6 +783,7 @@
       scan();
       return;
     }
+    if (postgameEngineLine(line)) return;
     if (line.startsWith('info ') && activeSearch && !activeSearch.stale && game?.fen() === activeSearch.fen) {
       const score = /\bscore (cp|mate) (-?\d+)/.exec(line);
       if (!score || /\b(?:upperbound|lowerbound)\b/.test(line)) return;
@@ -628,7 +824,8 @@
       }
       publishStreamState();
     }
-    beginSearch();
+    if (researchJob) beginPostgamePosition();
+    else beginSearch();
   }
   function downloadAsset(url, onProgress) {
     if (typeof GM_xmlhttpRequest !== 'function') {
@@ -693,6 +890,11 @@
         if (workerUrl) URL.revokeObjectURL(workerUrl);
         if (wasmBlobUrl) URL.revokeObjectURL(wasmBlobUrl);
         workerUrl = wasmBlobUrl = '';
+        if (researchJob) {
+          researchJob.cancelled = true;
+          finishPostgameResearch();
+          researchNoteEl.textContent = engineError;
+        }
       };
       worker.postMessage('setoption name CanOutputEngineDownloadProgress');
       worker.postMessage('uci');
@@ -851,6 +1053,23 @@
     }
   }
   panel.querySelector('#maia-web-retry').addEventListener('click', startEngine);
+  panel.querySelector('#maia-web-research-run').addEventListener('click', startPostgameResearch);
+  panel.querySelector('#maia-web-research-cancel').addEventListener('click', () => {
+    if (!researchJob) return;
+    researchJob.cancelled = true;
+    researchNoteEl.textContent = 'Stopping post-game research…';
+    if (researchJob.active) worker?.postMessage('stop');
+    else if (!activeSearch) finishPostgameResearch();
+  });
+  panel.querySelector('#maia-web-research-download').addEventListener('click', () => {
+    if (!researchResult) return;
+    const url = URL.createObjectURL(new Blob([JSON.stringify(researchResult, null, 2)], {type: 'application/json'}));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'stockfish19-postgame-research.json';
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  });
   depthEl.addEventListener('input', () => {
     depth = Math.max(10, Math.min(25, Number(depthEl.value) || 18));
     depthLabelEl.textContent = String(depth);

@@ -33,3 +33,9 @@ make clean package FINALPACKAGE=1
 Maia 3: [CSSLab/maia3](https://github.com/CSSLab/maia3).
 
 Using an assistant in online games may violate the game's fair-play rules.
+
+## Web userscript research
+
+`userscript.js` is a separate Stockfish 19 browser userscript. Its **Post-game move research** section accepts one completed-game PGN and evaluates the selected side's positions using Stockfish `19.0.1`, fixed depth 18, and `MultiPV` equal to the number of legal moves. The downloadable JSON contains each move's centipawn score and scaled loss `delta = phi(best) - phi(move)`, where `phi(z) = sign(z) * ln(1 + abs(z))` and scores are measured in pawns. Positions with missing full-depth scores or mate scores are marked incomplete for the move-law calculation.
+
+The optional `s` and `c` fields must contain values **refitted on honest reference games analyzed with this same Stockfish setup**. When supplied, the script solves `sum(p0 ^ w_i) = 1` with Newton's method (and a log-space safeguard) and exports the resulting move probabilities. The older published fit values are not used as defaults. Without a fitted joint alternative, clock model, rating corridor, and held-out calibration, the unified `E_N` statistic and statistical flag are intentionally unavailable. The attached research paper states that its equations have not been fitted to or tested on games.
