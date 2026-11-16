@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stockfish 19 Chess Board Assistant
 // @namespace    https://github.com/Jbsroboticsandautomationengineerstudent/Chess-study-training
-// @version      1.1.1
+// @version      1.2.0
 // @description  Stockfish 19 WASM board analysis and post-game move research
 // @match        https://www.chess.com/*
 // @match        https://chess.com/*
@@ -38,7 +38,9 @@
   let engineError = '';
   let engineCached = false;
   let cacheAvailable = true;
-  let depth = 18;
+  let depth = 11;
+  let autoPlay = false;
+  let autoPlayedFen = '';
   let activeSearch = null;
   let pendingSearch = null;
   let researchJob = null;
@@ -105,7 +107,10 @@
   panel.innerHTML = `
     <div id="maia-web-head"><span>Stockfish 19</span><span>drag</span></div>
     <div class="body">
-      <div class="row"><label for="maia-web-depth">Depth</label><input id="maia-web-depth" type="range" min="10" max="25" value="18"><span id="maia-web-depth-label">18</span></div>
+      <div class="row"><label for="maia-web-depth">Depth</label><input id="maia-web-depth" type="range" min="10" max="25" value="11"><span id="maia-web-depth-label">11</span></div>
+      <div class="row" title="Full single-threaded build; no strength handicap. Elo is not fixed by depth.">Full build · Max skill · Elo varies</div>
+      <div class="row"><button id="maia-web-autoplay">Auto-play bots: OFF</button>
+        <select id="maia-web-auto-side" aria-label="Side for bot auto-play"><option value="bottom">Bottom side</option><option value="w">White</option><option value="b">Black</option></select></div>
       <div class="row"><button id="maia-web-flip" title="Reverse arrow orientation">Flip</button></div>
       <div id="maia-web-status">Finding board…</div>
       <div id="maia-web-opening">Opening: —</div>
@@ -132,6 +137,8 @@
   const statusEl = panel.querySelector('#maia-web-status');
   const depthEl = panel.querySelector('#maia-web-depth');
   const depthLabelEl = panel.querySelector('#maia-web-depth-label');
+  const autoButton = panel.querySelector('#maia-web-autoplay');
+  const autoSideEl = panel.querySelector('#maia-web-auto-side');
   const openingEl = panel.querySelector('#maia-web-opening');
   const movesEl = panel.querySelector('#maia-web-moves');
   const fenEl = panel.querySelector('#maia-web-fen');
@@ -178,8 +185,10 @@
   }
   function isBlackView() {
     if (!board) return false;
-    const marked = board.closest('.flipped, .orientation-black, [data-orientation="black"]');
-    return Boolean(marked) !== flipOverride;
+    return boardViewBlack() !== flipOverride;
+  }
+  function boardViewBlack() {
+    return Boolean(board?.closest('.flipped, .orientation-black, [data-orientation="black"]'));
   }
   function squarePoint(square, black = isBlackView()) {
     const file = square.charCodeAt(0) - 97;
@@ -389,6 +398,59 @@
     }
     arrow.style.display = 'block';
     keepArrowAligned();
+  }
+  function botAutoPlayAllowed() {
+    return /^\/play\/computer(?:\/|$)/.test(location.pathname);
+  }
+  function autoSide() {
+    return autoSideEl.value === 'bottom' ? (isBlackView() ? 'b' : 'w') : autoSideEl.value;
+  }
+  function clickBoardSquare(square) {
+    if (!board?.isConnected) return false;
+    const point = squarePoint(square, isBlackView());
+    const rect = board.getBoundingClientRect();
+    const x = rect.left + rect.width * point.x / 100;
+    const y = rect.top + rect.height * point.y / 100;
+    const target = document.elementFromPoint(x, y);
+    if (!target || !board.contains(target)) return false;
+    const options = {bubbles: true, cancelable: true, composed: true,
+      clientX: x, clientY: y, button: 0, buttons: 1};
+    if (typeof PointerEvent === 'function') {
+      target.dispatchEvent(new PointerEvent('pointerdown', {...options, pointerId: 1, pointerType: 'mouse', isPrimary: true}));
+    }
+    target.dispatchEvent(new MouseEvent('mousedown', options));
+    if (typeof PointerEvent === 'function') {
+      target.dispatchEvent(new PointerEvent('pointerup', {...options, buttons: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true}));
+    }
+    target.dispatchEvent(new MouseEvent('mouseup', {...options, buttons: 0}));
+    target.dispatchEvent(new MouseEvent('click', {...options, buttons: 0}));
+    return true;
+  }
+  function choosePromotion(uci) {
+    if (uci.length !== 5) return;
+    const code = `${autoSide()}${uci[4]}`;
+    for (const element of document.querySelectorAll('.promotion-piece, .promotion-window .piece, .promotion-choices .piece')) {
+      if (!element.classList.contains(code) || !element.getClientRects().length) continue;
+      element.click();
+      return;
+    }
+  }
+  function maybeAutoPlay(fen, uci) {
+    if (!autoPlay || !botAutoPlayAllowed() || researchJob || activeSearch || pendingSearch || !board ||
+        game?.turn() !== autoSide() || autoPlayedFen === fen) return;
+    autoPlayedFen = fen; // One attempt per position, even if the site ignores synthetic events.
+    setTimeout(() => {
+      if (!autoPlay || !botAutoPlayAllowed() || researchJob || game?.fen() !== fen ||
+          shownMoves[0]?.uci !== uci || !board?.isConnected) return;
+      const moved = clickBoardSquare(uci.slice(0, 2)) && clickBoardSquare(uci.slice(2, 4));
+      if (!moved) { setStatus('Auto-play could not reach the board. Move manually.'); return; }
+      if (uci.length === 5) setTimeout(() => choosePromotion(uci), 50);
+      setTimeout(() => {
+        scan();
+        if (autoPlay && game?.fen() === fen)
+          setStatus('Chess.com did not accept the automatic move. Move manually.');
+      }, 900);
+    }, 0);
   }
 
   // Square coordinates use file X and rank Y, independent of rotation.
@@ -773,6 +835,8 @@
     if (line === 'uciok') {
       worker.postMessage('setoption name Hash value 32');
       worker.postMessage('setoption name MultiPV value 1');
+      worker.postMessage('setoption name UCI_LimitStrength value false');
+      worker.postMessage('setoption name Skill Level value 20');
       worker.postMessage('setoption name UCI_ShowWDL value true');
       worker.postMessage('isready');
       return;
@@ -821,6 +885,7 @@
         showValue(finished.evaluation, game.turn() === 'b');
         drawArrows();
         setStatus(`Stockfish 19 · depth ${finished.reachedDepth || finished.depth} · ${game.turn() === 'b' ? 'Black' : 'White'} to move`);
+        maybeAutoPlay(finished.fen, best);
       } else {
         clearPrediction();
         setStatus(best === undefined ? 'No legal moves.' : 'Stockfish returned an invalid move. Rescanning…');
@@ -1046,7 +1111,7 @@
         #mini-board .black-piece{color:#182018;text-shadow:0 1px 1px #fff9}
         #mini-arrow{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible}
         </style></head><body><main><h1>Stockfish 19</h1><div id="status">Connecting…</div>
-        <div id="depth">Depth: 18</div><div id="opening">Opening: —</div><div id="mini-board" aria-label="Current chess position"><svg id="mini-arrow" viewBox="0 0 100 100" aria-hidden="true"></svg></div>
+        <div id="depth">Depth: 11</div><div id="opening">Opening: —</div><div id="mini-board" aria-label="Current chess position"><svg id="mini-arrow" viewBox="0 0 100 100" aria-hidden="true"></svg></div>
         <ol id="moves"></ol><div id="labels"><span>White win —</span><span>Draw —</span><span>Black win —</span></div>
         <div id="bar"><span id="white"></span><span id="draw"></span><span id="black"></span></div>
         <div class="row"><button id="off">Streamer Mode: ON · Turn off</button></div></main></body></html>`);
@@ -1109,6 +1174,20 @@
     }
   }
   panel.querySelector('#maia-web-retry').addEventListener('click', startEngine);
+  autoButton.addEventListener('click', () => {
+    if (!autoPlay && !botAutoPlayAllowed()) {
+      setStatus('Auto-play is available only on Chess.com bot games (/play/computer).');
+      return;
+    }
+    autoPlay = !autoPlay;
+    autoButton.textContent = `Auto-play bots: ${autoPlay ? 'ON' : 'OFF'}`;
+    autoPlayedFen = '';
+    if (autoPlay && game && shownMoves[0]) maybeAutoPlay(game.fen(), shownMoves[0].uci);
+  });
+  autoSideEl.addEventListener('change', () => {
+    autoPlayedFen = '';
+    if (autoPlay && game && shownMoves[0]) maybeAutoPlay(game.fen(), shownMoves[0].uci);
+  });
   panel.querySelector('#maia-web-research-run').addEventListener('click', startPostgameResearch);
   panel.querySelector('#maia-web-research-cancel').addEventListener('click', () => {
     if (!researchJob) return;
@@ -1127,7 +1206,7 @@
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   });
   depthEl.addEventListener('input', () => {
-    depth = Math.max(10, Math.min(25, Number(depthEl.value) || 18));
+    depth = Math.max(10, Math.min(25, Number(depthEl.value) || 11));
     depthLabelEl.textContent = String(depth);
     lastFen = '';
     if (game) requestAnalysis(game.fen());
@@ -1139,6 +1218,8 @@
   panel.querySelector('#maia-web-flip').addEventListener('click', () => {
     flipOverride = !flipOverride;
     drawArrows();
+    autoPlayedFen = '';
+    if (autoPlay && game && shownMoves[0]) maybeAutoPlay(game.fen(), shownMoves[0].uci);
   });
   panel.querySelector('#maia-web-streamer').addEventListener('click', () => {
     if (streamerMode) stopStreamerMode();
