@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stockfish 19 Chess Board Assistant
 // @namespace    https://github.com/Jbsroboticsandautomationengineerstudent/Chess-study-training
-// @version      1.1.0
+// @version      1.1.1
 // @description  Stockfish 19 WASM board analysis and post-game move research
 // @match        https://www.chess.com/*
 // @match        https://chess.com/*
@@ -19,6 +19,7 @@
   const ENGINE_BASE = 'https://unpkg.com/stockfish@19.0.1/bin/';
   const ENGINE_SCRIPT = `${ENGINE_BASE}stockfish-19-single.js`;
   const ENGINE_WASM = `${ENGINE_BASE}stockfish-19-single.wasm`;
+  const ENGINE_CACHE = 'stockfish-19-assets-v1';
   const RESEARCH_DEPTH = 18;
   const ChessClass = typeof Chess !== 'undefined' ? Chess : window.Chess;
   if (!ChessClass) {
@@ -35,6 +36,8 @@
   let engineReady = false;
   let engineStarting = false;
   let engineError = '';
+  let engineCached = false;
+  let cacheAvailable = true;
   let depth = 18;
   let activeSearch = null;
   let pendingSearch = null;
@@ -779,7 +782,7 @@
       engineReady = true;
       engineError = '';
       if (wasmBlobUrl) { URL.revokeObjectURL(wasmBlobUrl); wasmBlobUrl = ''; }
-      setStatus('Stockfish 19 ready. Scanning board…');
+      setStatus(`Stockfish 19 ready${engineCached ? ' (saved engine)' : ''}. Scanning board…`);
       scan();
       return;
     }
@@ -844,6 +847,54 @@
       ontimeout: () => reject(new Error(`Timed out while downloading ${url}`))
     }));
   }
+  function openEngineCache() {
+    return new Promise((resolve, reject) => {
+      if (!('indexedDB' in window)) { reject(new Error('IndexedDB unavailable')); return; }
+      const request = indexedDB.open(ENGINE_CACHE, 1);
+      request.onupgradeneeded = () => request.result.createObjectStore('assets');
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error || new Error('IndexedDB open failed'));
+      request.onblocked = () => reject(new Error('IndexedDB upgrade blocked'));
+    });
+  }
+  async function cachedAsset(url) {
+    try {
+      const db = await openEngineCache();
+      return await new Promise((resolve, reject) => {
+        const request = db.transaction('assets', 'readonly').objectStore('assets').get(url);
+        request.onsuccess = () => { db.close(); resolve(request.result instanceof Blob && request.result.size ? request.result : null); };
+        request.onerror = () => { db.close(); reject(request.error); };
+      });
+    } catch {
+      cacheAvailable = false;
+      return null;
+    }
+  }
+  async function saveEngineAsset(url, blob) {
+    if (!cacheAvailable) return;
+    try {
+      const db = await openEngineCache();
+      await new Promise((resolve, reject) => {
+        const transaction = db.transaction('assets', 'readwrite');
+        transaction.objectStore('assets').put(blob, url);
+        transaction.oncomplete = resolve;
+        transaction.onerror = () => reject(transaction.error);
+        transaction.onabort = () => reject(transaction.error);
+      });
+      db.close();
+    } catch {
+      cacheAvailable = false; // Private mode or storage quota: run the downloaded engine anyway.
+    }
+  }
+  async function loadEngineAsset(url, label, onProgress) {
+    const saved = await cachedAsset(url);
+    if (saved) return {blob: saved, cached: true};
+    setStatus(`Downloading Stockfish 19 ${label}…`);
+    const blob = await downloadAsset(url, onProgress);
+    setStatus(`Saving Stockfish 19 ${label} for future visits…`);
+    await saveEngineAsset(url, blob);
+    return {blob, cached: false};
+  }
   async function startEngine() {
     if (engineStarting || engineReady) return;
     if (worker) worker.terminate();
@@ -854,17 +905,22 @@
     engineReady = false;
     engineStarting = true;
     engineError = '';
+    engineCached = false;
     activeSearch = pendingSearch = null;
     lastFen = '';
-    setStatus('Loading Stockfish 19 WASM (about 94 MB)…');
+    setStatus('Checking saved Stockfish 19 engine…');
     try {
-      const scriptBlob = await downloadAsset(ENGINE_SCRIPT);
-      const wasmBlob = await downloadAsset(ENGINE_WASM, (loaded, total) => {
-        const progress = total ? `${Math.floor(100 * loaded / total)}%` : `${(loaded / 1e6).toFixed(0)} MB`;
+      const scriptAsset = await loadEngineAsset(ENGINE_SCRIPT, 'script');
+      const wasmAsset = await loadEngineAsset(ENGINE_WASM, 'WASM', (loaded, total) => {
+        const progress = Number.isFinite(total) && total > 0 && loaded <= total
+          ? `${Math.min(100, Math.floor(100 * loaded / total))}%`
+          : `${(Math.max(0, loaded) / 1e6).toFixed(1)} MB`;
         setStatus(`Downloading Stockfish 19 WASM: ${progress}`);
       });
-      workerUrl = URL.createObjectURL(new Blob([scriptBlob], {type: 'text/javascript'}));
-      wasmBlobUrl = URL.createObjectURL(new Blob([wasmBlob], {type: 'application/wasm'}));
+      engineCached = scriptAsset.cached && wasmAsset.cached;
+      setStatus(engineCached ? 'Loading saved Stockfish 19 engine…' : 'Starting Stockfish 19 engine…');
+      workerUrl = URL.createObjectURL(new Blob([scriptAsset.blob], {type: 'text/javascript'}));
+      wasmBlobUrl = URL.createObjectURL(new Blob([wasmAsset.blob], {type: 'application/wasm'}));
       // The Stockfish worker accepts a WASM URL in its own URL fragment.
       worker = new Worker(`${workerUrl}#${encodeURIComponent(wasmBlobUrl)}`);
       worker.onmessage = event => {
