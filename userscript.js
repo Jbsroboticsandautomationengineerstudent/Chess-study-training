@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stockfish 19 / Maia 3 Chess Board Assistant
 // @namespace    https://github.com/Jbsroboticsandautomationengineerstudent/Chess-study-training
-// @version      1.4.1
+// @version      1.4.2
 // @description  Switchable Stockfish 19 and Maia 3 board analysis
 // @match        https://www.chess.com/*
 // @match        https://chess.com/*
@@ -82,9 +82,12 @@
   let inferenceId = 0;
   let depth = Math.max(10, Math.min(25, Number(readSetting('stockfish-depth') ?? 11) || 11));
   let autoPlay = readSetting('maia-autoplay') === 'true';
+  let autoNextBot = readSetting('maia-auto-next-bot') === 'true';
   let autoPlayedFen = '';
   let autoPlayTimer = 0;
   let autoPlayToken = 0;
+  let nextBotTimer = 0;
+  let nextBotAttempted = false;
   let activeSearch = null;
   let pendingSearch = null;
   let researchJob = null;
@@ -159,6 +162,7 @@
       <div class="row" id="maia-web-maia-note" hidden>Maia 79M · one prediction pass; no search depth</div>
       <div class="row" id="maia-web-auto-row" hidden><button id="maia-web-autoplay">Auto-play Maia: OFF</button>
         <select id="maia-web-auto-side" aria-label="Side for Maia auto-play"><option value="bottom">Bottom side</option><option value="w">White</option><option value="b">Black</option></select></div>
+      <div class="row" id="maia-web-next-row" hidden><button id="maia-web-next">Auto next bot game: OFF</button></div>
       <div class="row"><button id="maia-web-flip" title="Reverse arrow orientation">Flip</button></div>
       <div id="maia-web-status">Finding board…</div>
       <div id="maia-web-opening">Opening: —</div>
@@ -189,6 +193,7 @@
   const ratingEl = panel.querySelector('#maia-web-rating');
   const ratingLabelEl = panel.querySelector('#maia-web-rating-label');
   const autoButton = panel.querySelector('#maia-web-autoplay');
+  const nextButton = panel.querySelector('#maia-web-next');
   const autoSideEl = panel.querySelector('#maia-web-auto-side');
   const openingEl = panel.querySelector('#maia-web-opening');
   const movesEl = panel.querySelector('#maia-web-moves');
@@ -214,6 +219,8 @@
     inferenceId++;
     clearTimeout(autoPlayTimer);
     autoPlayToken++;
+    clearTimeout(nextBotTimer);
+    nextBotTimer = 0;
     if (activeSearch && worker) {
       activeSearch.stale = true;
       worker.postMessage('stop');
@@ -461,8 +468,11 @@
   function autoPlayablePage() {
     return /^\/(?:play|game)\//.test(location.pathname);
   }
+  function botGamePage() {
+    return /^\/play\/computer(?:\/|$)/.test(location.pathname);
+  }
   function botThinkingDelay() {
-    if (!/^\/play\/computer(?:\/|$)/.test(location.pathname)) return 0;
+    if (!botGamePage()) return 0;
     // A bounded illustrative clock density: t0 + lognormal noise. Its parameters
     // are not fitted to human games, so this is a bot-game pace control only.
     const choices = Math.min(40, game?.moves().length || 20);
@@ -551,6 +561,46 @@
           setStatus('Chess.com did not accept the automatic move. Move manually.');
       }, 1200);
     }, delay);
+  }
+  function visibleBotResult() {
+    const selectors = '[data-cy*="game-over"], [data-testid*="game-over"], [class*="game-over"], [class*="gameOver"]';
+    return Array.from(document.querySelectorAll(selectors)).some(el => el.getClientRects().length &&
+      getComputedStyle(el).visibility !== 'hidden');
+  }
+  function nextBotGameButton() {
+    const label = /^(?:new(?: game)?|next game|play again|rematch)(?:\s+\d+\s*(?:s|sec|secs|seconds?|min|mins|minutes?))?$/i;
+    for (const el of document.querySelectorAll('button, [role="button"], a, [data-cy*="new-game"]')) {
+      if (el.closest('#maia-web-panel') || el.disabled || el.getAttribute('aria-disabled') === 'true' ||
+          !el.getClientRects().length || getComputedStyle(el).visibility === 'hidden') continue;
+      const text = (el.textContent || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+      if (label.test(text)) return el;
+    }
+    return null;
+  }
+  function maybeStartNextBotGame() {
+    if (engineMode !== 'maia' || !autoPlay || !autoNextBot || !botGamePage()) {
+      clearTimeout(nextBotTimer);
+      nextBotTimer = 0;
+      return;
+    }
+    const finished = Boolean(game?.game_over?.() || visibleBotResult());
+    if (!finished) {
+      clearTimeout(nextBotTimer);
+      nextBotTimer = 0;
+      nextBotAttempted = false;
+      return;
+    }
+    if (nextBotAttempted || nextBotTimer) return;
+    const button = nextBotGameButton();
+    if (!button) return;
+    nextBotTimer = setTimeout(() => {
+      nextBotTimer = 0;
+      if (engineMode !== 'maia' || !autoPlay || !autoNextBot || !botGamePage() || !button.isConnected ||
+          !(game?.game_over?.() || visibleBotResult()) || nextBotGameButton() !== button) return;
+      nextBotAttempted = true;
+      setStatus('Starting next bot game…');
+      button.click();
+    }, 800);
   }
 
   // Square coordinates use file X and rank Y, independent of rotation.
@@ -718,6 +768,7 @@
       game = next; lastBoard = placement; clearPrediction();
       rememberPosition(game);
     }
+    maybeStartNextBotGame();
     if (!game) return;
     const fen = game.fen();
     if (fenEl.textContent !== fen) fenEl.textContent = fen;
@@ -1414,7 +1465,7 @@
     const state = {type: 'state', status: statusEl.textContent, opening: openingName,
       fen: game?.fen() || '', blackView: board ? isBlackView() : lastBoardOrientation,
       skin: captureBoardSkin(),
-      engineMode, depth, maiaRating, autoPlay,
+      engineMode, depth, maiaRating, autoPlay, autoNextBot,
       moves: shownMoves.map(move => ({uci: move.uci, label: move.label, metric: move.metric})),
       value: shownValue ? [...shownValue] : null};
     const signature = JSON.stringify(state);
@@ -1471,6 +1522,7 @@
         <div id="bar"><span id="white"></span><span id="draw"></span><span id="black"></span></div>
         <div class="row"><button id="human">Enable human moves: ${engineMode === 'maia' ? 'ON' : 'OFF'}</button></div>
         <div class="row"><button id="auto" ${engineMode === 'maia' ? '' : 'hidden'}>Auto-play Maia: ${autoPlay ? 'ON' : 'OFF'}</button></div>
+        <div class="row"><button id="next" ${engineMode === 'maia' ? '' : 'hidden'}>Auto next bot game: ${autoNextBot ? 'ON' : 'OFF'}</button></div>
         <div class="row"><button id="off">Streamer Mode: ON · Turn off</button></div></main></body></html>`);
       popup.document.close();
       const miniBoard = popup.document.getElementById('mini-board');
@@ -1488,6 +1540,7 @@
         if (event.data?.type === 'off') stopStreamerMode();
         if (event.data?.type === 'engine-toggle') humanButton.click();
         if (event.data?.type === 'auto-toggle') autoButton.click();
+        if (event.data?.type === 'next-toggle') nextButton.click();
       };
       popupChannel.onmessage = event => {
         if (event.data?.type !== 'state' || popup.closed) return;
@@ -1496,6 +1549,8 @@
         popup.document.getElementById('human').textContent = `Enable human moves: ${state.engineMode === 'maia' ? 'ON' : 'OFF'}`;
         popup.document.getElementById('auto').hidden = state.engineMode !== 'maia';
         popup.document.getElementById('auto').textContent = `Auto-play Maia: ${state.autoPlay ? 'ON' : 'OFF'}`;
+        popup.document.getElementById('next').hidden = state.engineMode !== 'maia';
+        popup.document.getElementById('next').textContent = `Auto next bot game: ${state.autoNextBot ? 'ON' : 'OFF'}`;
         popup.document.getElementById('status').textContent = state.status;
         popup.document.getElementById('depth').textContent = state.engineMode === 'maia'
           ? `Maia rating: ${state.maiaRating} · single pass` : `Depth: ${state.depth}`;
@@ -1518,6 +1573,7 @@
       };
       popup.document.getElementById('human').addEventListener('click', () => popupChannel.postMessage({type: 'engine-toggle'}));
       popup.document.getElementById('auto').addEventListener('click', () => popupChannel.postMessage({type: 'auto-toggle'}));
+      popup.document.getElementById('next').addEventListener('click', () => popupChannel.postMessage({type: 'next-toggle'}));
       popup.document.getElementById('off').addEventListener('click', () => popupChannel.postMessage({type: 'off'}));
       streamPopup = popup;
       streamerMode = true;
@@ -1545,7 +1601,9 @@
     const maia = engineMode === 'maia';
     humanButton.textContent = `Enable human moves: ${maia ? 'ON' : 'OFF'}`;
     autoButton.textContent = `Auto-play Maia: ${autoPlay ? 'ON' : 'OFF'}`;
+    nextButton.textContent = `Auto next bot game: ${autoNextBot ? 'ON' : 'OFF'}`;
     panel.querySelector('#maia-web-auto-row').hidden = !maia;
+    panel.querySelector('#maia-web-next-row').hidden = !maia;
     panel.querySelector('#maia-web-head span').textContent = maia ? 'Maia 79M · Human moves' : 'Stockfish 19';
     panel.querySelector('#maia-web-stockfish-settings').hidden = maia;
     panel.querySelector('#maia-web-stockfish-strength').hidden = maia;
@@ -1603,7 +1661,15 @@
     clearTimeout(autoPlayTimer);
     autoPlayToken++;
     autoPlayedFen = '';
+    maybeStartNextBotGame();
     if (autoPlay && game && shownMoves[0]) maybeAutoPlay(game.fen(), shownMoves[0].uci);
+  });
+  nextButton.addEventListener('click', () => {
+    if (engineMode !== 'maia') return;
+    autoNextBot = !autoNextBot;
+    saveSetting('maia-auto-next-bot', autoNextBot);
+    syncEngineUi();
+    maybeStartNextBotGame();
   });
   autoSideEl.addEventListener('change', () => {
     saveSetting('maia-auto-side', autoSideEl.value);
