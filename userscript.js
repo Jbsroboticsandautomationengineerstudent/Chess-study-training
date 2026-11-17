@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stockfish 19 / Maia 3 Chess Board Assistant
 // @namespace    https://github.com/Jbsroboticsandautomationengineerstudent/Chess-study-training
-// @version      1.5.0
+// @version      1.5.1
 // @description  Switchable Stockfish 19 and Maia 3 board analysis
 // @match        https://www.chess.com/*
 // @match        https://chess.com/*
@@ -30,6 +30,7 @@
   const MAIA_MODEL_MIN_BYTES = 300_000_000;
   const ORT_DIST = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/';
   const RESEARCH_DEPTH = 18;
+  const TOP_MOVE_COLORS = ['#00008A', '#3273b7', '#7fa7d1'];
   const REVIEW_PALETTE = {
     Brilliant: {color: '#28c9bd', icon: '!!'}, Great: {color: '#6f9fca', icon: '!'},
     Best: {color: '#78b847', icon: '★'}, Excellent: {color: '#93bf5c', icon: '+'},
@@ -183,6 +184,7 @@
     #maia-web-research .row input{flex:1;width:0;min-width:0}
     #maia-web-research .row select{max-width:95px}
     #maia-web-research-note{font-size:11px;color:#c6d5e4;white-space:pre-wrap}
+    #maia-web-arrow-note{font-size:11px;color:#aebfd0;margin:3px 0 8px}
     @media(max-width:600px){#maia-web-panel{top:68px;right:8px}}
   `;
   document.documentElement.appendChild(style);
@@ -206,8 +208,10 @@
       <div id="maia-web-review-card" class="review-card" hidden><strong>Move review</strong>
         <div id="maia-web-review-scores" class="review-scores"></div>
         <div id="maia-web-review-details"></div>
-        <div id="maia-web-review-current"></div><div id="maia-web-review-legend" class="review-legend"></div></div>
+        <div id="maia-web-review-current"></div><div id="maia-web-category-lines"></div>
+        <div id="maia-web-review-legend" class="review-legend"></div></div>
       <ol id="maia-web-moves"></ol>
+      <div id="maia-web-arrow-note" hidden></div>
       <div id="maia-web-value"><div id="maia-web-value-label"><span>White win —</span><span>Draw —</span><span>Black win —</span></div>
         <div id="maia-web-value-bar" role="img" aria-label="Estimated win probabilities"><span id="maia-web-white"></span><span id="maia-web-draw"></span><span id="maia-web-black"></span></div></div>
       <div class="row"><button id="maia-web-retry">Retry engine</button>
@@ -238,12 +242,14 @@
   const autoSideEl = panel.querySelector('#maia-web-auto-side');
   const openingEl = panel.querySelector('#maia-web-opening');
   const movesEl = panel.querySelector('#maia-web-moves');
+  const arrowNoteEl = panel.querySelector('#maia-web-arrow-note');
   const fenEl = panel.querySelector('#maia-web-fen');
   const researchNoteEl = panel.querySelector('#maia-web-research-note');
   const reviewCard = panel.querySelector('#maia-web-review-card');
   const reviewScores = panel.querySelector('#maia-web-review-scores');
   const reviewDetails = panel.querySelector('#maia-web-review-details');
   const reviewCurrent = panel.querySelector('#maia-web-review-current');
+  const categoryLinesEl = panel.querySelector('#maia-web-category-lines');
   const reviewLegend = panel.querySelector('#maia-web-review-legend');
   const valueLabels = panel.querySelectorAll('#maia-web-value-label span');
   const valueSegments = ['#maia-web-white', '#maia-web-draw', '#maia-web-black'].map(selector => panel.querySelector(selector));
@@ -321,23 +327,29 @@
     const endX = b.x - ux * 3.2, endY = b.y - uy * 3.2;
     const line = doc.createElementNS(svgNS, 'line');
     const color = move.color || '#00008A';
-    for (const [name, value] of Object.entries({x1: a.x, y1: a.y, x2: endX, y2: endY, stroke: color, 'stroke-width': 1.8, 'stroke-linecap': 'round'})) line.setAttribute(name, value);
+    const opacity = move.opacity ?? 1;
+    for (const [name, value] of Object.entries({x1: a.x, y1: a.y, x2: endX, y2: endY,
+      stroke: color, 'stroke-opacity': opacity, 'stroke-width': move.rank === 1 ? 2.1 : 1.7,
+      'stroke-linecap': 'round'})) line.setAttribute(name, value);
     svg.appendChild(line);
     const tip = doc.createElementNS(svgNS, 'polygon');
     const wingX = -uy * 2.1, wingY = ux * 2.1;
     tip.setAttribute('points', `${b.x},${b.y} ${b.x - ux * 4.3 + wingX},${b.y - uy * 4.3 + wingY} ${b.x - ux * 4.3 - wingX},${b.y - uy * 4.3 - wingY}`);
     tip.setAttribute('fill', color);
+    tip.setAttribute('fill-opacity', opacity);
     svg.appendChild(tip);
     if (move.icon) {
       const badge = doc.createElementNS(svgNS, 'circle');
       for (const [name, value] of Object.entries({cx: b.x, cy: b.y - 3.3, r: 2.5, fill: color}))
         badge.setAttribute(name, value);
+      badge.setAttribute('fill-opacity', opacity);
       svg.appendChild(badge);
       const icon = doc.createElementNS(svgNS, 'text');
       for (const [name, value] of Object.entries({x: b.x, y: b.y - 2.25, 'text-anchor': 'middle',
         'font-size': move.icon.length > 1 ? 2.5 : 3.2, 'font-weight': 800, fill: '#fff'}))
         icon.setAttribute(name, value);
       icon.textContent = move.icon;
+      icon.setAttribute('opacity', opacity);
       svg.appendChild(icon);
     }
     const label = doc.createElementNS(svgNS, 'text');
@@ -351,11 +363,12 @@
     if (move.label) {
       const background = doc.createElementNS(svgNS, 'rect');
       for (const [name, value] of Object.entries({x: b.x - 5.5, y: b.y + 1.4,
-        width: 11, height: 4.3, rx: 1, fill: '#10251b', opacity: 0.9}))
+        width: 11, height: 4.3, rx: 1, fill: '#10251b', opacity: 0.9 * opacity}))
         background.setAttribute(name, value);
       svg.appendChild(background);
     }
     label.textContent = move.label || '';
+    label.setAttribute('opacity', opacity);
     svg.appendChild(label);
     return true;
   }
@@ -455,7 +468,7 @@
     return String(value || '').replace(/(-?\d+(?:\.\d+)?)px/g,
       (_, size) => `${(Number(size) * factor).toFixed(2)}px`);
   }
-  function renderMiniBoard(doc, fen, blackView, move, skin, recentMove = null) {
+  function renderMiniBoard(doc, fen, blackView, moves, skin, recentMove = null) {
     const pieces = new Map();
     const ranks = fen?.split(' ')[0]?.split('/') || [];
     if (ranks.length === 8) {
@@ -514,9 +527,22 @@
     });
     const miniArrow = doc.getElementById('mini-arrow');
     miniArrow.replaceChildren();
-    if (ranks.length === 8 && move) paintMoveArrow(miniArrow, doc, move, blackView);
-    if (ranks.length === 8 && recentMove && recentMove.uci !== move?.uci)
+    if (ranks.length === 8 && Array.isArray(moves))
+      for (const move of [...moves].slice(0, 10).reverse()) paintMoveArrow(miniArrow, doc, move, blackView);
+    if (ranks.length === 8 && recentMove && !moves?.some(move => move.uci === recentMove.uci))
       paintMoveArrow(miniArrow, doc, recentMove, blackView);
+  }
+  function displayArrowMoves(moves = shownMoves) {
+    const categories = categoryArrowsForBoard();
+    if (categories.length) return categories;
+    const display = moves.slice(0, studyReviewPage() ? 3 : 1);
+    const reviewed = reviewMoveForBoard();
+    if (reviewed) {
+      const same = display.findIndex(move => move.uci === reviewed.uci);
+      if (same >= 0) display[same] = reviewed;
+      else display.push(reviewed);
+    }
+    return display;
   }
   function drawArrows(moves = shownMoves) {
     if (streamerMode) {
@@ -525,10 +551,17 @@
       return;
     }
     arrow.replaceChildren();
-    const move = reviewMoveForBoard() || moves[0];
+    const displayMoves = displayArrowMoves(moves);
+    arrowNoteEl.hidden = !studyReviewPage();
+    arrowNoteEl.textContent = displayMoves.some(move => move.category)
+      ? 'Category colors come from completed all-move review at this position.'
+      : 'For move-quality arrows, analyze a PGN and open a matching position.';
     const recent = botGamePage() ? liveReview[liveReview.length - 1] : null;
-    let drawn = board && move ? paintMoveArrow(arrow, document, move, isBlackView()) : false;
-    if (board && recent?.review && recent.postFen === game?.fen() && recent.played !== move?.uci) {
+    let drawn = false;
+    if (board) for (const move of [...displayMoves].reverse())
+      drawn = paintMoveArrow(arrow, document, move, isBlackView()) || drawn;
+    if (board && recent?.review && recent.postFen === game?.fen() &&
+        !displayMoves.some(move => move.uci === recent.played)) {
       const visual = REVIEW_PALETTE[recent.review.category];
       drawn = paintMoveArrow(arrow, document, {uci: recent.played, color: visual.color,
         icon: visual.icon, label: `${recent.review.accuracy.toFixed(0)}%`}, isBlackView()) || drawn;
@@ -815,7 +848,11 @@
 
   function scan() {
     const study = studyReviewPage();
-    if (study !== lastStudyRoute) { lastStudyRoute = study; syncEngineUi(); }
+    if (study !== lastStudyRoute) {
+      lastStudyRoute = study;
+      lastFen = '';
+      syncEngineUi();
+    }
     const currentOpening = readOpeningName();
     if (currentOpening !== openingName) {
       openingName = currentOpening;
@@ -1070,12 +1107,20 @@
       const largest = candidates[0].logit;
       const total = candidates.reduce((sum, move) => sum + Math.exp(move.logit - largest), 0);
       const best = candidates[0];
-      const percent = 100 / total;
-      shownMoves = [{uci: best.uci, label: `${percent.toFixed(1)}%`, metric: 'Move probability'}];
+      shownMoves = candidates.slice(0, studyReviewPage() ? 3 : 1).map((candidate, rank) => ({
+        uci: candidate.uci, label: `${(100 * Math.exp(candidate.logit - largest) / total).toFixed(1)}%`,
+        metric: 'Move probability', rank: rank + 1,
+        color: TOP_MOVE_COLORS[rank], opacity: [1, 0.78, 0.62][rank]
+      }));
       movesEl.replaceChildren();
-      const item = document.createElement('li');
-      item.textContent = `${best.uci} · Move probability ${percent.toFixed(1)}%`;
-      movesEl.appendChild(item);
+      for (const move of shownMoves) {
+        const item = document.createElement('li');
+        item.textContent = `${move.uci} · Move probability ${move.label}`;
+        item.style.color = '#e5efff';
+        item.style.borderLeft = `3px solid ${move.color}`;
+        item.style.paddingLeft = '6px';
+        movesEl.appendChild(item);
+      }
       showMaiaValue(output.logits_value?.data, black);
       drawArrows();
       setStatus(`Maia 79M · ${maiaBackend} · rating ${maiaRating} · ${black ? 'Black' : 'White'} to move`);
@@ -1176,6 +1221,26 @@
     return {uci: item.played, label: `${item.review.accuracy.toFixed(0)}%`,
       metric: `${item.review.category} · review accuracy`, color: visual.color, icon: visual.icon};
   }
+  function categoryArrowsForBoard() {
+    if (!studyReviewPage() || !game) return [];
+    const position = reviewEntries().find(item => item.fen === game.fen() && item.complete &&
+      item.moves?.length === item.legalCount &&
+      item.moves.every(move => Number.isFinite(move.cp)));
+    if (!position) return [];
+    const best = position.moves[0], secondCp = position.moves[1]?.cp;
+    const representatives = new Map();
+    for (const candidate of position.moves) {
+      const loss = Math.max(0, best.cp - candidate.cp);
+      const quality = qualityFromLoss(loss, best.cp, candidate.cp,
+        candidate.uci === best.uci, secondCp);
+      if (representatives.has(quality.category)) continue;
+      const visual = REVIEW_PALETTE[quality.category];
+      representatives.set(quality.category, {uci: candidate.uci,
+        label: `${quality.accuracy.toFixed(0)}%`, metric: `${quality.category} · review accuracy`,
+        color: visual.color, icon: visual.icon, category: quality.category});
+    }
+    return [...representatives.values()];
+  }
   function reviewSummary(entries) {
     const summary = {w: {count: 0, sum: 0, lossCp: 0}, b: {count: 0, sum: 0, lossCp: 0}};
     for (const item of entries) {
@@ -1219,6 +1284,13 @@
       ? `${matched ? 'Reviewed move' : 'Last evaluated move'} · ${current.review.category} ${REVIEW_PALETTE[current.review.category].icon} · ${current.played} · ${current.review.lossCp} cp lost${current.review.depth ? ` · depth ${current.review.depth}` : ''}`
       : 'Open a reviewed position to see its move label.';
     reviewCurrent.style.color = current ? REVIEW_PALETTE[current.review.category].color : '';
+    categoryLinesEl.replaceChildren();
+    for (const move of categoryArrowsForBoard()) {
+      const line = document.createElement('div');
+      line.style.color = move.color;
+      line.textContent = `${move.icon} ${move.category} · ${move.uci} · ${move.label}`;
+      categoryLinesEl.appendChild(line);
+    }
     const counts = Object.fromEntries(Object.keys(REVIEW_PALETTE).map(name => [name, 0]));
     for (const item of entries) if (item.review) counts[item.review.category]++;
     reviewLegend.replaceChildren();
@@ -1237,7 +1309,10 @@
       (botGamePage() && engineMode === 'maia' ? ' · evaluation paused' : '');
     boardReview.style.borderColor = current ? REVIEW_PALETTE[current.review.category].color : '#59708a';
     alignBoardReview();
-    if (reviewMoveForBoard()) drawArrows();
+    if (categoryArrowsForBoard().length || reviewMoveForBoard()) {
+      drawArrows();
+      publishStreamState();
+    }
   }
   function startPostgameResearch() {
     if (researchJob) return;
@@ -1380,8 +1455,11 @@
 
   function beginSearch() {
     if (engineMode !== 'stockfish' || !engineReady || activeSearch || !pendingSearch || !worker || researchJob) return;
-    activeSearch = {...pendingSearch, stale: false, evaluation: null, reachedDepth: 0};
+    activeSearch = {...pendingSearch, stale: false, evaluation: null, reachedDepth: 0,
+      lines: new Map(), multipv: studyReviewPage() ? Math.min(3, game.moves().length) : 1,
+      legal: new Set(game.moves({verbose: true}).map(move => `${move.from}${move.to}${move.promotion || ''}`))};
     pendingSearch = null;
+    worker.postMessage(`setoption name MultiPV value ${activeSearch.multipv}`);
     worker.postMessage(`position fen ${activeSearch.fen}`);
     worker.postMessage(`go depth ${activeSearch.depth}`);
     setStatus(`Stockfish 19 · analyzing depth ${activeSearch.depth}…`);
@@ -1429,13 +1507,20 @@
       const wdl = /\bwdl (\d+) (\d+) (\d+)/.exec(line);
       const foundDepth = /\bdepth (\d+)/.exec(line);
       const reachedDepth = foundDepth ? Number(foundDepth[1]) : 0;
+      const rank = Number(/\bmultipv (\d+)/.exec(line)?.[1] || 1);
+      const pv = /\bpv ([a-h][1-8][a-h][1-8][qrbn]?)/.exec(line)?.[1];
+      const evaluation = {cp: score[1] === 'cp' ? Number(score[2]) : null,
+        mate: score[1] === 'mate' ? Number(score[2]) : null,
+        wdl: wdl ? wdl.slice(1).map(Number) : null};
+      if (rank >= 1 && rank <= activeSearch.multipv && pv && activeSearch.legal.has(pv)) {
+        const previous = activeSearch.lines.get(rank);
+        if (!previous || reachedDepth >= previous.depth)
+          activeSearch.lines.set(rank, {uci: pv, depth: reachedDepth, evaluation});
+      }
+      if (rank !== 1) return;
       if (reachedDepth < activeSearch.reachedDepth) return;
       activeSearch.reachedDepth = reachedDepth;
-      activeSearch.evaluation = {
-        cp: score[1] === 'cp' ? Number(score[2]) : null,
-        mate: score[1] === 'mate' ? Number(score[2]) : null,
-        wdl: wdl ? wdl.slice(1).map(Number) : null
-      };
+      activeSearch.evaluation = evaluation;
       showValue(activeSearch.evaluation, game.turn() === 'b');
       setStatus(`Stockfish 19 · depth ${reachedDepth}/${activeSearch.depth} · ${game.turn() === 'b' ? 'Black' : 'White'} to move`);
       publishStreamState();
@@ -1449,15 +1534,34 @@
       const legal = game.moves({verbose: true}).some(move =>
         `${move.from}${move.to}${move.promotion || ''}` === best);
       if (best && legal) {
-        const expected = stockfishExpectedScore(finished.evaluation);
-        shownMoves = [{uci: best, label: expected === null ? '' : `${expected.toFixed(1)}%`,
-          metric: 'Expected score',
-          ...(studyReviewPage() ? {color: REVIEW_PALETTE.Best.color, icon: REVIEW_PALETTE.Best.icon} : {})}];
+        const candidates = [{uci: best, rank: 1, evaluation: finished.evaluation}];
+        if (studyReviewPage()) for (let rank = 2; rank <= finished.multipv; rank++) {
+          const alternative = finished.lines.get(rank);
+          if (alternative?.depth < finished.reachedDepth || !alternative ||
+              candidates.some(move => move.uci === alternative.uci)) continue;
+          candidates.push({...alternative, rank});
+        }
+        const bestCp = finished.evaluation?.cp;
+        shownMoves = candidates.map((candidate, index) => {
+          const expected = stockfishExpectedScore(candidate.evaluation);
+          const loss = Number.isFinite(bestCp) && Number.isFinite(candidate.evaluation?.cp)
+            ? Math.max(0, bestCp - candidate.evaluation.cp) : null;
+          const category = index === 0 ? 'Best' : loss === null ? null :
+            qualityFromLoss(loss, bestCp, candidate.evaluation.cp, false).category;
+          const visual = category ? REVIEW_PALETTE[category] : null;
+          return {uci: candidate.uci, label: expected === null ? '' : `${expected.toFixed(1)}%`,
+            metric: category ? `${category} · expected score` : 'Expected score', rank: index + 1,
+            color: studyReviewPage() ? visual?.color || TOP_MOVE_COLORS[index] : undefined,
+            icon: studyReviewPage() ? visual?.icon : undefined,
+            opacity: [1, 0.78, 0.62][index]};
+        });
         movesEl.replaceChildren();
-        const item = document.createElement('li');
-        item.textContent = expected === null ? `${best} · WDL unavailable` :
-          `${best} · ${studyReviewPage() ? 'Best at search depth · ' : ''}Expected score ${expected.toFixed(1)}%`;
-        movesEl.appendChild(item);
+        for (const move of shownMoves) {
+          const item = document.createElement('li');
+          item.textContent = `${move.uci} · ${move.metric} ${move.label || 'WDL unavailable'}`;
+          if (move.color) item.style.color = move.color;
+          movesEl.appendChild(item);
+        }
         showValue(finished.evaluation, game.turn() === 'b');
         if (botGamePage() && Number.isFinite(finished.evaluation?.cp)) {
           if (livePending?.postFen === finished.fen && livePending.side !== game.turn()) {
@@ -1695,7 +1799,6 @@
   }
   function publishStreamState() {
     if (!streamerMode || !streamChannel) return;
-    const reviewed = reviewMoveForBoard();
     const entries = reviewEntries();
     const totals = reviewSummary(entries);
     const recent = botGamePage() ? liveReview[liveReview.length - 1] : null;
@@ -1705,8 +1808,9 @@
       fen: game?.fen() || '', blackView: board ? isBlackView() : lastBoardOrientation,
       skin: captureBoardSkin(),
       engineMode, depth, maiaRating, autoPlay, autoNextBot, study: studyReviewPage(),
-      moves: (reviewed ? [reviewed] : shownMoves).map(move =>
-        ({uci: move.uci, label: move.label, metric: move.metric, color: move.color, icon: move.icon})),
+      moves: displayArrowMoves().map(move =>
+        ({uci: move.uci, label: move.label, metric: move.metric, color: move.color,
+          icon: move.icon, opacity: move.opacity, rank: move.rank, category: move.category})),
       recent: recentVisual ? {uci: recent.played, label: `${recent.review.accuracy.toFixed(0)}%`,
         color: recentVisual.color, icon: recentVisual.icon} : null,
       review: studyReviewPage() && entries.some(item => item.review) ? {
@@ -1806,13 +1910,18 @@
         reviewLine.hidden = !state.review;
         const formatReview = value => value === null ? '—' : `${value.toFixed(1)}%`;
         reviewLine.textContent = state.review ? `Review accuracy · White ${formatReview(state.review.white)} · Black ${formatReview(state.review.black)}` : '';
-        renderMiniBoard(popup.document, state.fen, state.blackView, state.moves[0], state.skin, state.recent);
+        renderMiniBoard(popup.document, state.fen, state.blackView, state.moves, state.skin, state.recent);
         const list = popup.document.getElementById('moves');
         list.replaceChildren();
-        for (const move of state.moves.slice(0, 1)) {
+        for (const move of state.moves.slice(0, 10)) {
           const item = popup.document.createElement('li');
           item.textContent = move.label ? `${move.uci} · ${move.metric || 'Score'} ${move.label}` :
             `${move.uci} · WDL unavailable`;
+          if (move.color) {
+            item.style.color = state.engineMode === 'maia' && !move.category ? '#e5efff' : move.color;
+            item.style.borderLeft = `3px solid ${move.color}`;
+            item.style.paddingLeft = '6px';
+          }
           list.appendChild(item);
         }
         const labels = popup.document.querySelectorAll('#labels span');
