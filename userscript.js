@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stockfish 19 Chess Board Assistant
 // @namespace    https://github.com/Jbsroboticsandautomationengineerstudent/Chess-study-training
-// @version      1.3.0
+// @version      1.3.1
 // @description  Switchable Stockfish 19 and Maia 3 board analysis
 // @match        https://www.chess.com/*
 // @match        https://chess.com/*
@@ -197,6 +197,7 @@
     shownValue = null;
     valueLabels.forEach((label, index) => { label.textContent = `${['White win', 'Draw', 'Black win'][index]} —`; });
     valueSegments.forEach(segment => { segment.style.width = '0%'; });
+    panel.querySelector('#maia-web-value-bar').setAttribute('aria-label', 'Win probabilities unavailable');
     arrow.replaceChildren();
     arrow.style.display = 'none';
     publishStreamState();
@@ -240,15 +241,19 @@
     svg.appendChild(tip);
     const label = doc.createElementNS(svgNS, 'text');
     label.setAttribute('x', b.x);
-    label.setAttribute('y', b.y + 4.3);
+    label.setAttribute('y', b.y + 4.6);
     label.setAttribute('text-anchor', 'middle');
-    label.setAttribute('font-size', '2.8');
+    label.setAttribute('font-size', '3.1');
     label.setAttribute('font-weight', '700');
     label.setAttribute('font-family', 'system-ui,sans-serif');
-    label.setAttribute('fill', '#24dc83');
-    label.setAttribute('stroke', '#10251b');
-    label.setAttribute('stroke-width', '0.8');
-    label.setAttribute('paint-order', 'stroke');
+    label.setAttribute('fill', '#fff');
+    if (move.label) {
+      const background = doc.createElementNS(svgNS, 'rect');
+      for (const [name, value] of Object.entries({x: b.x - 5.5, y: b.y + 1.4,
+        width: 11, height: 4.3, rx: 1, fill: '#10251b', opacity: 0.9}))
+        background.setAttribute(name, value);
+      svg.appendChild(background);
+    }
     label.textContent = move.label || '';
     svg.appendChild(label);
     return true;
@@ -731,6 +736,7 @@
       shownValue = null;
       valueLabels.forEach((label, index) => { label.textContent = `${['White win', 'Draw', 'Black win'][index]} —`; });
       valueSegments.forEach(segment => { segment.style.width = '0%'; });
+      panel.querySelector('#maia-web-value-bar').setAttribute('aria-label', 'Win probabilities unavailable');
       return;
     }
     const largest = Math.max(...logits);
@@ -742,6 +748,8 @@
       label.textContent = `${['White win', 'Draw', 'Black win'][index]} ${shownValue[index].toFixed(1)}%`;
     });
     valueSegments.forEach((segment, index) => { segment.style.width = `${shownValue[index]}%`; });
+    panel.querySelector('#maia-web-value-bar').setAttribute('aria-label',
+      `Maia estimate: white win ${shownValue[0].toFixed(1)}%, draw ${shownValue[1].toFixed(1)}%, black win ${shownValue[2].toFixed(1)}%`);
   }
   async function legacyMaiaModel() {
     try {
@@ -856,10 +864,10 @@
       const total = candidates.reduce((sum, move) => sum + Math.exp(move.logit - largest), 0);
       const best = candidates[0];
       const percent = 100 / total;
-      shownMoves = [{uci: best.uci, label: `${percent.toFixed(1)}%`}];
+      shownMoves = [{uci: best.uci, label: `${percent.toFixed(1)}%`, metric: 'Move probability'}];
       movesEl.replaceChildren();
       const item = document.createElement('li');
-      item.textContent = `${best.uci} (${percent.toFixed(1)}%)`;
+      item.textContent = `${best.uci} · Move probability ${percent.toFixed(1)}%`;
       movesEl.appendChild(item);
       showMaiaValue(output.logits_value?.data, black);
       drawArrows();
@@ -1126,10 +1134,13 @@
       const legal = game.moves({verbose: true}).some(move =>
         `${move.from}${move.to}${move.promotion || ''}` === best);
       if (best && legal) {
-        shownMoves = [{uci: best, label: ''}];
+        const expected = stockfishExpectedScore(finished.evaluation);
+        shownMoves = [{uci: best, label: expected === null ? '' : `${expected.toFixed(1)}%`,
+          metric: 'Expected score'}];
         movesEl.replaceChildren();
         const item = document.createElement('li');
-        item.textContent = best;
+        item.textContent = expected === null ? `${best} · WDL unavailable` :
+          `${best} · Expected score ${expected.toFixed(1)}%`;
         movesEl.appendChild(item);
         showValue(finished.evaluation, game.turn() === 'b');
         drawArrows();
@@ -1295,30 +1306,41 @@
     }
   }
 
+  function stockfishExpectedScore(evaluation) {
+    const wdl = evaluation?.wdl;
+    if (Array.isArray(wdl) && wdl.length === 3 && wdl.every(value => Number.isFinite(value) && value >= 0)) {
+      const total = wdl.reduce((sum, value) => sum + value, 0);
+      if (total > 0) return 100 * (wdl[0] + wdl[1] / 2) / total;
+    }
+    if (Number.isFinite(evaluation?.mate)) return evaluation.mate > 0 ? 100 : 0;
+    return null;
+  }
   function showValue(evaluation, blackToMove) {
     if (!evaluation) {
       shownValue = null;
       valueLabels.forEach((label, index) => { label.textContent = `${['White win', 'Draw', 'Black win'][index]} —`; });
       valueSegments.forEach(segment => { segment.style.width = '0%'; });
+      panel.querySelector('#maia-web-value-bar').setAttribute('aria-label', 'Win probabilities unavailable');
       return;
     }
     let win, draw, loss;
-    const total = evaluation.wdl?.reduce((sum, value) => sum + value, 0) || 0;
+    const wdl = evaluation.wdl;
+    const total = Array.isArray(wdl) && wdl.length === 3 &&
+      wdl.every(value => Number.isFinite(value) && value >= 0) ? wdl.reduce((sum, value) => sum + value, 0) : 0;
     if (total > 0) {
-      [win, draw, loss] = evaluation.wdl.map(value => 100 * value / total);
-    } else if (evaluation.mate !== null) {
+      [win, draw, loss] = wdl.map(value => 100 * value / total);
+    } else if (Number.isFinite(evaluation.mate)) {
       [win, draw, loss] = evaluation.mate > 0 ? [100, 0, 0] : [0, 0, 100];
     } else {
-      // Fallback only: centipawns do not determine exact win/draw/loss odds.
-      const expected = 1 / (1 + Math.exp(-evaluation.cp / 180));
-      draw = 28 * Math.exp(-Math.abs(evaluation.cp) / 250);
-      win = (100 - draw) * expected;
-      loss = 100 - draw - win;
+      shownValue = null;
+      valueLabels.forEach((label, index) => { label.textContent = `${['White win', 'Draw', 'Black win'][index]} —`; });
+      valueSegments.forEach(segment => { segment.style.width = '0%'; });
+      panel.querySelector('#maia-web-value-bar').setAttribute('aria-label', 'Win probabilities unavailable');
+      return;
     }
     const percentages = blackToMove ? [loss, draw, win] : [win, draw, loss];
     shownValue = percentages;
-    const prefix = total > 0 ? '' : '~';
-    valueLabels.forEach((label, index) => { label.textContent = `${['White win', 'Draw', 'Black win'][index]} ${prefix}${percentages[index].toFixed(1)}%`; });
+    valueLabels.forEach((label, index) => { label.textContent = `${['White win', 'Draw', 'Black win'][index]} ${percentages[index].toFixed(1)}%`; });
     valueSegments.forEach((segment, index) => { segment.style.width = `${percentages[index]}%`; });
     panel.querySelector('#maia-web-value-bar').setAttribute('aria-label', `Estimated: white win ${percentages[0].toFixed(1)}%, draw ${percentages[1].toFixed(1)}%, black win ${percentages[2].toFixed(1)}%`);
   }
@@ -1327,7 +1349,7 @@
     const state = {type: 'state', status: statusEl.textContent, opening: openingName,
       fen: game?.fen() || '', blackView: board ? isBlackView() : lastBoardOrientation,
       skin: captureBoardSkin(),
-      engineMode, depth, maiaRating, moves: shownMoves.map(move => ({uci: move.uci, label: move.label})),
+      engineMode, depth, maiaRating, moves: shownMoves.map(move => ({uci: move.uci, label: move.label, metric: move.metric})),
       value: shownValue ? [...shownValue] : null};
     const signature = JSON.stringify(state);
     if (signature === lastStreamSignature) return;
@@ -1412,7 +1434,8 @@
         list.replaceChildren();
         for (const move of state.moves.slice(0, 1)) {
           const item = popup.document.createElement('li');
-          item.textContent = move.label ? `${move.uci} (${move.label})` : move.uci;
+          item.textContent = move.label ? `${move.uci} · ${move.metric || 'Score'} ${move.label}` :
+            `${move.uci} · WDL unavailable`;
           list.appendChild(item);
         }
         const labels = popup.document.querySelectorAll('#labels span');
