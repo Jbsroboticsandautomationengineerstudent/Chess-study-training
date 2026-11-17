@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stockfish 19 / Maia 3 Chess Board Assistant
 // @namespace    https://github.com/Jbsroboticsandautomationengineerstudent/Chess-study-training
-// @version      1.4.4
+// @version      1.5.0
 // @description  Switchable Stockfish 19 and Maia 3 board analysis
 // @match        https://www.chess.com/*
 // @match        https://chess.com/*
@@ -30,6 +30,22 @@
   const MAIA_MODEL_MIN_BYTES = 300_000_000;
   const ORT_DIST = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/';
   const RESEARCH_DEPTH = 18;
+  const REVIEW_PALETTE = {
+    Brilliant: {color: '#28c9bd', icon: '!!'}, Great: {color: '#6f9fca', icon: '!'},
+    Best: {color: '#78b847', icon: '★'}, Excellent: {color: '#93bf5c', icon: '+'},
+    Good: {color: '#76ae70', icon: '✓'}, Book: {color: '#b7976e', icon: 'B'},
+    Inaccuracy: {color: '#e2c145', icon: '?!'}, Mistake: {color: '#e69b58', icon: '?'},
+    Miss: {color: '#dc6968', icon: '×'}, Blunder: {color: '#d6534f', icon: '??'}
+  };
+  const REVIEW_RULES = {
+    Brilliant: 'Unavailable: needs validated sacrifice analysis',
+    Great: 'Best move; at least 150 cp ahead of the second choice, which is below -100 cp',
+    Best: 'Evaluation loss up to 10 cp', Excellent: 'Evaluation loss up to 35 cp',
+    Good: 'Evaluation loss up to 80 cp', Book: 'Unavailable: needs an opening book',
+    Inaccuracy: 'Evaluation loss up to 160 cp', Mistake: 'Evaluation loss up to 300 cp',
+    Miss: 'A winning +150 cp position falls to 0 or worse after a 160-300 cp loss',
+    Blunder: 'Evaluation loss greater than 300 cp'
+  };
   const ChessClass = typeof Chess !== 'undefined' ? Chess : window.Chess;
   const ortApi = typeof ort !== 'undefined' ? ort : window.ort;
   if (!ChessClass) {
@@ -92,6 +108,12 @@
   let pendingSearch = null;
   let researchJob = null;
   let researchResult = null;
+  let reviewSignature = '';
+  let lastStudyRoute = null;
+  let liveReview = [];
+  let livePending = null;
+  let lastSearchResult = null;
+  let showResearchResult = false;
   let openingName = '';
   let lastFen = '';
   let lastBoard = '';
@@ -115,18 +137,33 @@
   const style = document.createElement('style');
   style.textContent = `
     #maia-web-panel{position:fixed;top:90px;right:16px;z-index:2147483646;
-      width:min(290px,calc(100vw - 24px));box-sizing:border-box;background:#17212d;
-      color:#f7f9fb;border:1px solid #50657b;border-radius:12px;
-      box-shadow:0 8px 28px #0008;font:13px/1.4 system-ui,-apple-system,sans-serif}
+      width:min(320px,calc(100vw - 24px));box-sizing:border-box;background:#15212c;
+      color:#f7f9fb;border:1px solid #496276;border-radius:12px;
+      box-shadow:0 14px 36px #0009;font:13px/1.4 system-ui,-apple-system,sans-serif}
     #maia-web-panel *{box-sizing:border-box}
-    #maia-web-head{padding:10px 12px;background:#26394c;border-radius:11px 11px 0 0;
+    #maia-web-head{padding:11px 13px;background:linear-gradient(115deg,#253d4e,#1c2c3c);
+      border-bottom:2px solid #37b9aa;border-radius:11px 11px 0 0;letter-spacing:.02em;
       font-weight:700;cursor:grab;touch-action:none;user-select:none;display:flex;justify-content:space-between}
     #maia-web-panel .body{padding:10px 12px}
+    #maia-web-panel .review-card{margin:8px 0;padding:9px;border:1px solid #50657b;border-radius:8px;background:#213144}
+    #maia-web-panel .review-card strong{font-size:12px;letter-spacing:.02em}
+    #maia-web-panel .review-scores{display:flex;justify-content:space-between;gap:8px;margin-top:5px;font-variant-numeric:tabular-nums}
+    #maia-web-review-details,#maia-web-review-current{font-size:11px;color:#c8d8e6;margin-top:4px}
+    #maia-web-panel .review-legend{display:flex;flex-wrap:wrap;gap:4px;margin-top:7px}
+    #maia-web-panel .review-chip{font-size:10px;padding:2px 5px;border-radius:4px;color:#0e1921;font-weight:700}
+    #maia-web-panel .review-chip[aria-disabled="true"]{opacity:.45}
+    #maia-web-board-review{position:fixed;z-index:2147483644;pointer-events:none;box-sizing:border-box;
+      padding:6px 10px;border:1px solid #59708a;border-radius:7px;background:#17212de9;color:#f7f9fb;
+      font:600 12px/1.3 system-ui,-apple-system,sans-serif;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+      box-shadow:0 3px 12px #0006}
     #maia-web-panel .row{display:flex;align-items:center;gap:7px;margin-bottom:7px}
     #maia-web-panel [hidden]{display:none!important}
     #maia-web-panel select,#maia-web-panel input,#maia-web-panel button{
       color:#fff;background:#33485d;border:1px solid #708296;border-radius:5px;padding:4px 6px;font:inherit}
     #maia-web-panel button{cursor:pointer}
+    #maia-web-panel button:hover{border-color:#79adbb;background:#3b5668}
+    #maia-web-panel button:focus-visible,#maia-web-panel select:focus-visible,
+    #maia-web-panel input:focus-visible{outline:2px solid #55d7c4;outline-offset:2px}
     #maia-web-depth,#maia-web-rating{width:auto;min-width:0;flex:1;accent-color:#24dc83}
     #maia-web-depth-label,#maia-web-rating-label{min-width:25px;text-align:right;font-variant-numeric:tabular-nums}
     #maia-web-panel input{width:100%;font:11px/1.4 ui-monospace,monospace}
@@ -166,6 +203,10 @@
       <div class="row"><button id="maia-web-flip" title="Reverse arrow orientation">Flip</button></div>
       <div id="maia-web-status">Finding board…</div>
       <div id="maia-web-opening">Opening: —</div>
+      <div id="maia-web-review-card" class="review-card" hidden><strong>Move review</strong>
+        <div id="maia-web-review-scores" class="review-scores"></div>
+        <div id="maia-web-review-details"></div>
+        <div id="maia-web-review-current"></div><div id="maia-web-review-legend" class="review-legend"></div></div>
       <ol id="maia-web-moves"></ol>
       <div id="maia-web-value"><div id="maia-web-value-label"><span>White win —</span><span>Draw —</span><span>Black win —</span></div>
         <div id="maia-web-value-bar" role="img" aria-label="Estimated win probabilities"><span id="maia-web-white"></span><span id="maia-web-draw"></span><span id="maia-web-black"></span></div></div>
@@ -177,12 +218,12 @@
       <div id="maia-web-fen"></div>
       <details id="maia-web-research"><summary>Post-game move research</summary>
         <textarea id="maia-web-pgn" placeholder="Paste a completed game's PGN"></textarea>
-        <div class="row"><select id="maia-web-research-side" aria-label="Side to analyze"><option value="w">White moves</option><option value="b">Black moves</option></select>
+        <div class="row"><select id="maia-web-research-side" aria-label="Side to analyze"><option value="both">Both sides</option><option value="w">White moves</option><option value="b">Black moves</option></select>
           <input id="maia-web-s" type="number" min="0" step="any" placeholder="Fitted s" aria-label="Fitted sensitivity s">
           <input id="maia-web-c" type="number" min="0" step="any" placeholder="Fitted c" aria-label="Fitted consistency c"></div>
         <div class="row"><button id="maia-web-research-run">Analyze PGN</button><button id="maia-web-research-cancel" disabled>Cancel</button></div>
         <div class="row"><button id="maia-web-research-download" disabled>Download JSON</button></div>
-        <div id="maia-web-research-note">Fixed depth 18; every legal move. Fitted s,c are required for probabilities. E_N needs separate calibrated q and clock models.</div>
+        <div id="maia-web-research-note">Fixed depth 18; every legal move. Review accuracy is calculated from evaluation loss. Fitted s,c are required for move probabilities.</div>
       </details>
     </div>`;
   document.documentElement.appendChild(panel);
@@ -199,6 +240,11 @@
   const movesEl = panel.querySelector('#maia-web-moves');
   const fenEl = panel.querySelector('#maia-web-fen');
   const researchNoteEl = panel.querySelector('#maia-web-research-note');
+  const reviewCard = panel.querySelector('#maia-web-review-card');
+  const reviewScores = panel.querySelector('#maia-web-review-scores');
+  const reviewDetails = panel.querySelector('#maia-web-review-details');
+  const reviewCurrent = panel.querySelector('#maia-web-review-current');
+  const reviewLegend = panel.querySelector('#maia-web-review-legend');
   const valueLabels = panel.querySelectorAll('#maia-web-value-label span');
   const valueSegments = ['#maia-web-white', '#maia-web-draw', '#maia-web-black'].map(selector => panel.querySelector(selector));
 
@@ -207,11 +253,17 @@
   arrow.setAttribute('viewBox', '0 0 100 100');
   document.documentElement.appendChild(arrow);
   arrow.style.display = 'none';
+  const boardReview = document.createElement('div');
+  boardReview.id = 'maia-web-board-review';
+  boardReview.hidden = true;
+  document.documentElement.appendChild(boardReview);
   const svgNS = 'http://www.w3.org/2000/svg';
 
   function setStatus(message) {
-    if (statusEl.textContent !== message) {
-      statusEl.textContent = message;
+    const displayed = studyReviewPage() ? String(message).replace(/Stockfish 19|Stockfish/g, 'Precision search')
+      .replace(/Maia 79M|Maia/g, 'Human model') : message;
+    if (statusEl.textContent !== displayed) {
+      statusEl.textContent = displayed;
       publishStreamState();
     }
   }
@@ -238,6 +290,7 @@
     publishStreamState();
   }
   function keepArrowAligned() {
+    alignBoardReview();
     if (streamerMode || !board || arrow.style.display === 'none') return;
     const r = board.getBoundingClientRect();
     arrow.style.left = `${r.left}px`;
@@ -267,13 +320,26 @@
     const ux = dx / length, uy = dy / length;
     const endX = b.x - ux * 3.2, endY = b.y - uy * 3.2;
     const line = doc.createElementNS(svgNS, 'line');
-    for (const [name, value] of Object.entries({x1: a.x, y1: a.y, x2: endX, y2: endY, stroke: '#00008A', 'stroke-width': 1.8, 'stroke-linecap': 'round'})) line.setAttribute(name, value);
+    const color = move.color || '#00008A';
+    for (const [name, value] of Object.entries({x1: a.x, y1: a.y, x2: endX, y2: endY, stroke: color, 'stroke-width': 1.8, 'stroke-linecap': 'round'})) line.setAttribute(name, value);
     svg.appendChild(line);
     const tip = doc.createElementNS(svgNS, 'polygon');
     const wingX = -uy * 2.1, wingY = ux * 2.1;
     tip.setAttribute('points', `${b.x},${b.y} ${b.x - ux * 4.3 + wingX},${b.y - uy * 4.3 + wingY} ${b.x - ux * 4.3 - wingX},${b.y - uy * 4.3 - wingY}`);
-    tip.setAttribute('fill', '#00008A');
+    tip.setAttribute('fill', color);
     svg.appendChild(tip);
+    if (move.icon) {
+      const badge = doc.createElementNS(svgNS, 'circle');
+      for (const [name, value] of Object.entries({cx: b.x, cy: b.y - 3.3, r: 2.5, fill: color}))
+        badge.setAttribute(name, value);
+      svg.appendChild(badge);
+      const icon = doc.createElementNS(svgNS, 'text');
+      for (const [name, value] of Object.entries({x: b.x, y: b.y - 2.25, 'text-anchor': 'middle',
+        'font-size': move.icon.length > 1 ? 2.5 : 3.2, 'font-weight': 800, fill: '#fff'}))
+        icon.setAttribute(name, value);
+      icon.textContent = move.icon;
+      svg.appendChild(icon);
+    }
     const label = doc.createElementNS(svgNS, 'text');
     label.setAttribute('x', b.x);
     label.setAttribute('y', b.y + 4.6);
@@ -389,7 +455,7 @@
     return String(value || '').replace(/(-?\d+(?:\.\d+)?)px/g,
       (_, size) => `${(Number(size) * factor).toFixed(2)}px`);
   }
-  function renderMiniBoard(doc, fen, blackView, move, skin) {
+  function renderMiniBoard(doc, fen, blackView, move, skin, recentMove = null) {
     const pieces = new Map();
     const ranks = fen?.split(' ')[0]?.split('/') || [];
     if (ranks.length === 8) {
@@ -449,6 +515,8 @@
     const miniArrow = doc.getElementById('mini-arrow');
     miniArrow.replaceChildren();
     if (ranks.length === 8 && move) paintMoveArrow(miniArrow, doc, move, blackView);
+    if (ranks.length === 8 && recentMove && recentMove.uci !== move?.uci)
+      paintMoveArrow(miniArrow, doc, recentMove, blackView);
   }
   function drawArrows(moves = shownMoves) {
     if (streamerMode) {
@@ -457,11 +525,15 @@
       return;
     }
     arrow.replaceChildren();
-    const move = moves[0];
-    if (!board || !move || !paintMoveArrow(arrow, document, move, isBlackView())) {
-      arrow.style.display = 'none';
-      return;
+    const move = reviewMoveForBoard() || moves[0];
+    const recent = botGamePage() ? liveReview[liveReview.length - 1] : null;
+    let drawn = board && move ? paintMoveArrow(arrow, document, move, isBlackView()) : false;
+    if (board && recent?.review && recent.postFen === game?.fen() && recent.played !== move?.uci) {
+      const visual = REVIEW_PALETTE[recent.review.category];
+      drawn = paintMoveArrow(arrow, document, {uci: recent.played, color: visual.color,
+        icon: visual.icon, label: `${recent.review.accuracy.toFixed(0)}%`}, isBlackView()) || drawn;
     }
+    if (!drawn) { arrow.style.display = 'none'; return; }
     arrow.style.display = 'block';
     keepArrowAligned();
   }
@@ -704,6 +776,20 @@
     }
     return matches.length === 1 ? matches[0] : null;
   }
+  function transitionMove(before, after) {
+    if (!before || !after) return null;
+    const target = after.fen().split(' ').slice(0, 2).join(' ');
+    const matches = [];
+    for (const move of before.moves({verbose: true})) {
+      const candidate = new ChessClass(before.fen());
+      try {
+        candidate.move({from: move.from, to: move.to, promotion: move.promotion || 'q'});
+        if (candidate.fen().split(' ').slice(0, 2).join(' ') === target)
+          matches.push(`${move.from}${move.to}${move.promotion || ''}`);
+      } catch { /* Ignore transient positions. */ }
+    }
+    return matches.length === 1 ? matches[0] : null;
+  }
   function rememberPosition(position) {
     const placement = position.fen().split(' ')[0];
     const positions = seenPositions.get(placement) || new Set();
@@ -728,6 +814,8 @@
   }
 
   function scan() {
+    const study = studyReviewPage();
+    if (study !== lastStudyRoute) { lastStudyRoute = study; syncEngineUi(); }
     const currentOpening = readOpeningName();
     if (currentOpening !== openingName) {
       openingName = currentOpening;
@@ -740,13 +828,14 @@
       if (board && shownMoves.length) drawArrows();
       else arrow.style.display = 'none';
     }
-    if (!board) { if (!engineStarting) setStatus('Scanning Chess.com for a board…'); return; }
+    if (!board) { boardReview.hidden = true; if (!engineStarting) setStatus('Scanning Chess.com for a board…'); return; }
     lastBoardOrientation = isBlackView();
     const directFen = boardFen(board);
     const placement = directFen?.fen().split(' ')[0] || piecesFrom(board);
-    if (!placement) { if (!engineStarting) setStatus('Board found. Waiting for position data…'); return; }
+    if (!placement) { boardReview.hidden = true; if (!engineStarting) setStatus('Board found. Waiting for position data…'); return; }
     const fromSite = (directFen?.fen().split(' ')[0] === placement ? directFen : null) || siteFen(placement);
     if (placement !== lastBoard || !game || (fromSite && fromSite.fen() !== game.fen())) {
+      const previous = game;
       let next = fromSite;
       if (!next && game && game.fen().split(' ')[0] === placement) next = game;
       if (!next) next = nextGame(placement);
@@ -765,6 +854,24 @@
         return;
       }
       missedCount = 0;
+      if (botGamePage() && engineMode === 'stockfish' && previous && next &&
+          previous.fen() !== next.fen()) {
+        if (next.fen().split(' ')[0] === START_PLACEMENT) {
+          liveReview = [];
+          livePending = null;
+          lastSearchResult = null;
+          showResearchResult = false;
+          reviewSignature = '';
+        } else {
+          const played = transitionMove(previous, next);
+          livePending = played && lastSearchResult?.fen === previous.fen() &&
+            Number.isFinite(lastSearchResult.cp) ? {
+              fen: previous.fen(), postFen: next.fen(), side: previous.turn(), played,
+              best: lastSearchResult.best, bestCp: lastSearchResult.cp,
+              depth: lastSearchResult.depth
+            } : null;
+        }
+      }
       game = next; lastBoard = placement; clearPrediction();
       rememberPosition(game);
     }
@@ -777,6 +884,7 @@
       else if (maiaError) setStatus(maiaError);
     } else if (engineReady && !researchJob) requestAnalysis(fen);
     else if (engineError) setStatus(engineError);
+    renderReview();
     keepArrowAligned();
     publishStreamState();
   }
@@ -842,7 +950,7 @@
     });
     valueSegments.forEach((segment, index) => { segment.style.width = `${shownValue[index]}%`; });
     panel.querySelector('#maia-web-value-bar').setAttribute('aria-label',
-      `Maia estimate: white win ${shownValue[0].toFixed(1)}%, draw ${shownValue[1].toFixed(1)}%, black win ${shownValue[2].toFixed(1)}%`);
+      `Model estimate: white win ${shownValue[0].toFixed(1)}%, draw ${shownValue[1].toFixed(1)}%, black win ${shownValue[2].toFixed(1)}%`);
   }
   async function legacyMaiaModel() {
     try {
@@ -1032,10 +1140,109 @@
     if (residual >= 1e-14) throw new Error(`Move-law normalisation residual ${residual} exceeds tolerance.`);
     return {losses, weights, probabilities, residual};
   }
+  function qualityFromLoss(lossCp, bestCp, playedCp, isBest, secondCp = null) {
+    let category;
+    if (isBest && Number.isFinite(secondCp) && bestCp >= 0 && secondCp <= -100 &&
+        bestCp - secondCp >= 150) category = 'Great';
+    else if (lossCp <= 10) category = 'Best';
+    else if (lossCp <= 35) category = 'Excellent';
+    else if (lossCp <= 80) category = 'Good';
+    else if (lossCp > 300) category = 'Blunder';
+    else if (bestCp >= 150 && playedCp <= 0 && lossCp >= 160) category = 'Miss';
+    else if (lossCp <= 160) category = 'Inaccuracy';
+    else category = 'Mistake';
+    return {category, lossCp, accuracy: 100 * Math.exp(-lossCp / 150)};
+  }
+  function classifyReviewedMove(result) {
+    if (!result.complete || !result.moves?.length) return null;
+    const best = result.moves[0];
+    const played = result.moves.find(move => move.uci === result.played);
+    if (!played || !Number.isFinite(best.cp) || !Number.isFinite(played.cp)) return null;
+    const lossCp = Math.max(0, best.cp - played.cp);
+    return qualityFromLoss(lossCp, best.cp, played.cp, played.uci === best.uci, result.moves[1]?.cp);
+  }
+  function studyReviewPage() {
+    return /^\/(?:analysis(?:\/|$)|play\/computer(?:\/|$))/.test(location.pathname);
+  }
+  function reviewForBoard() {
+    const entries = reviewEntries();
+    return game ? entries.find(item => item.fen === game.fen() && item.review) : null;
+  }
+  function reviewMoveForBoard() {
+    if (!/^\/analysis(?:\/|$)/.test(location.pathname)) return null;
+    const item = reviewForBoard();
+    if (!item) return null;
+    const visual = REVIEW_PALETTE[item.review.category];
+    return {uci: item.played, label: `${item.review.accuracy.toFixed(0)}%`,
+      metric: `${item.review.category} · review accuracy`, color: visual.color, icon: visual.icon};
+  }
+  function reviewSummary(entries) {
+    const summary = {w: {count: 0, sum: 0, lossCp: 0}, b: {count: 0, sum: 0, lossCp: 0}};
+    for (const item of entries) {
+      if (!item.review || !summary[item.side]) continue;
+      summary[item.side].count++;
+      summary[item.side].sum += item.review.accuracy;
+      summary[item.side].lossCp += item.review.lossCp;
+    }
+    return summary;
+  }
+  function reviewEntries() {
+    if (researchJob) return researchJob.results;
+    if (botGamePage() && !showResearchResult) return liveReview;
+    return researchResult?.positions || liveReview;
+  }
+  function alignBoardReview() {
+    if (boardReview.hidden || !board || streamerMode) return;
+    const rect = board.getBoundingClientRect();
+    boardReview.style.left = `${Math.max(4, rect.left)}px`;
+    boardReview.style.top = `${Math.max(4, rect.top - 36)}px`;
+    boardReview.style.maxWidth = `${Math.max(180, rect.width)}px`;
+  }
+  function renderReview() {
+    const entries = reviewEntries();
+    const available = entries.some(item => item.review);
+    reviewCard.hidden = !available || !studyReviewPage();
+    boardReview.hidden = !available || !studyReviewPage() || streamerMode || !board;
+    if (!available) { reviewSignature = ''; return; }
+    const matched = reviewForBoard();
+    const current = matched || (botGamePage() ? liveReview[liveReview.length - 1] : null);
+    const signature = `${entries.length}|${game?.fen() || ''}|${streamerMode}|${board?.isConnected}|${location.pathname}|${engineMode}`;
+    if (signature === reviewSignature) { alignBoardReview(); return; }
+    reviewSignature = signature;
+    const totals = reviewSummary(entries);
+    const score = side => totals[side].count ? `${(totals[side].sum / totals[side].count).toFixed(1)}%` : '—';
+    reviewScores.textContent = `White ${score('w')} (${totals.w.count}) · Black ${score('b')} (${totals.b.count})`;
+    const completed = totals.w.count + totals.b.count;
+    const meanLoss = completed ? (totals.w.lossCp + totals.b.lossCp) / completed : 0;
+    reviewDetails.textContent = `${completed}/${entries.length} moves scored · mean loss ${meanLoss.toFixed(0)} cp`;
+    reviewCurrent.textContent = current
+      ? `${matched ? 'Reviewed move' : 'Last evaluated move'} · ${current.review.category} ${REVIEW_PALETTE[current.review.category].icon} · ${current.played} · ${current.review.lossCp} cp lost${current.review.depth ? ` · depth ${current.review.depth}` : ''}`
+      : 'Open a reviewed position to see its move label.';
+    reviewCurrent.style.color = current ? REVIEW_PALETTE[current.review.category].color : '';
+    const counts = Object.fromEntries(Object.keys(REVIEW_PALETTE).map(name => [name, 0]));
+    for (const item of entries) if (item.review) counts[item.review.category]++;
+    reviewLegend.replaceChildren();
+    for (const [name, visual] of Object.entries(REVIEW_PALETTE)) {
+      const chip = document.createElement('span');
+      chip.className = 'review-chip';
+      chip.style.background = visual.color;
+      chip.textContent = `${visual.icon} ${name} ${counts[name]}`;
+      chip.title = REVIEW_RULES[name];
+      chip.setAttribute('aria-label', `${name}: ${counts[name]}. ${REVIEW_RULES[name]}`);
+      chip.setAttribute('aria-disabled', counts[name] ? 'false' : 'true');
+      reviewLegend.appendChild(chip);
+    }
+    boardReview.textContent = `Review accuracy · White ${score('w')} · Black ${score('b')}` +
+      (current ? ` · ${current.review.category} ${REVIEW_PALETTE[current.review.category].icon}` : '') +
+      (botGamePage() && engineMode === 'maia' ? ' · evaluation paused' : '');
+    boardReview.style.borderColor = current ? REVIEW_PALETTE[current.review.category].color : '#59708a';
+    alignBoardReview();
+    if (reviewMoveForBoard()) drawArrows();
+  }
   function startPostgameResearch() {
     if (researchJob) return;
-    if (engineMode !== 'stockfish') { researchNoteEl.textContent = 'Turn Human moves OFF to use Stockfish post-game research.'; return; }
-    if (!engineReady || !worker) { researchNoteEl.textContent = 'Stockfish 19 must finish loading first.'; return; }
+    if (engineMode !== 'stockfish') { researchNoteEl.textContent = 'Select Precision style to run the fixed-depth move review.'; return; }
+    if (!engineReady || !worker) { researchNoteEl.textContent = 'Precision search must finish loading first.'; return; }
     const pgn = panel.querySelector('#maia-web-pgn').value.trim();
     const side = panel.querySelector('#maia-web-research-side').value;
     const sText = panel.querySelector('#maia-web-s').value.trim();
@@ -1057,8 +1264,8 @@
       const replay = new ChessClass(parsed.fen());
       const positions = [];
       for (const move of history) {
-        if (replay.turn() === side) positions.push({
-          fen: replay.fen(), played: `${move.from}${move.to}${move.promotion || ''}`,
+        if (side === 'both' || replay.turn() === side) positions.push({
+          fen: replay.fen(), side: replay.turn(), played: `${move.from}${move.to}${move.promotion || ''}`,
           legal: replay.moves({verbose: true}).map(candidate =>
             `${candidate.from}${candidate.to}${candidate.promotion || ''}`)
         });
@@ -1066,7 +1273,9 @@
       }
       if (!positions.length) throw new Error('PGN has no moves for the selected side.');
       researchResult = null;
+      showResearchResult = true;
       researchJob = {positions, results: [], index: 0, active: null, side, s, c, cancelled: false};
+      renderReview();
       panel.querySelector('#maia-web-research-run').disabled = true;
       panel.querySelector('#maia-web-research-cancel').disabled = false;
       panel.querySelector('#maia-web-research-download').disabled = true;
@@ -1084,7 +1293,7 @@
     }
     const position = researchJob.positions[researchJob.index];
     researchJob.active = {position, scores: new Map()};
-    researchNoteEl.textContent = `Stockfish 19 fixed depth ${RESEARCH_DEPTH}: position ${researchJob.index + 1}/${researchJob.positions.length}, ${position.legal.length} legal moves…`;
+    researchNoteEl.textContent = `Fixed depth ${RESEARCH_DEPTH}: position ${researchJob.index + 1}/${researchJob.positions.length}, ${position.legal.length} legal moves…`;
     worker.postMessage(`setoption name MultiPV value ${position.legal.length}`);
     worker.postMessage(`position fen ${position.fen}`);
     worker.postMessage(`go depth ${RESEARCH_DEPTH}`);
@@ -1112,7 +1321,7 @@
       const complete = moves.every(move => move.depth >= RESEARCH_DEPTH);
       const centipawnsOnly = moves.every(move => Number.isFinite(move.cp));
       const sorted = centipawnsOnly ? [...moves].sort((a, b) => b.cp - a.cp) : moves;
-      const result = {fen: active.position.fen, played: active.position.played,
+      const result = {fen: active.position.fen, side: active.position.side, played: active.position.played,
         legalCount: active.position.legal.length, complete, moves: sorted,
         reason: !complete ? 'Missing full-depth evaluation for one or more moves' :
           !centipawnsOnly ? 'Mate scores cannot be converted to pawn values without a stated rule' : null};
@@ -1131,7 +1340,9 @@
           } catch (error) { result.reason = `Move law unavailable: ${error.message}`; }
         }
       }
+      result.review = classifyReviewedMove(result);
       researchJob.results.push(result);
+      renderReview();
       researchJob.index++;
     }
     researchJob.active = null;
@@ -1153,11 +1364,16 @@
         calibration: job.s === null ? null : {s: job.s, c: job.c, source: 'user supplied; not verified'},
         eProcess: null,
         eProcessReason: 'Requires fitted joint alternative q, two-regime clock density, rating corridor and held-out calibration.',
-        positions: job.results
+        positions: job.results,
+        review: {formula: 'Mean of 100 * exp(-centipawn loss / 150) over fully evaluated moves',
+          thresholdsCp: {Best: 10, Excellent: 35, Good: 80, Inaccuracy: 160, Mistake: 300},
+          summary: reviewSummary(job.results),
+          unsupported: ['Brilliant: requires validated sacrifice analysis', 'Book: requires an opening book']}
       };
       panel.querySelector('#maia-web-research-download').disabled = false;
-      researchNoteEl.textContent = `Analyzed ${job.results.length} positions. Download JSON for evaluations and scaled losses. E_N unavailable without calibrated data.`;
+      researchNoteEl.textContent = `Reviewed ${job.results.length} positions at fixed depth ${RESEARCH_DEPTH}. Scores are this project's evaluation-loss metric, not Chess.com accuracy. Brilliant and Book require additional evidence. E_N remains unavailable without calibration.`;
     }
+    renderReview();
     lastFen = '';
     scan();
   }
@@ -1235,13 +1451,30 @@
       if (best && legal) {
         const expected = stockfishExpectedScore(finished.evaluation);
         shownMoves = [{uci: best, label: expected === null ? '' : `${expected.toFixed(1)}%`,
-          metric: 'Expected score'}];
+          metric: 'Expected score',
+          ...(studyReviewPage() ? {color: REVIEW_PALETTE.Best.color, icon: REVIEW_PALETTE.Best.icon} : {})}];
         movesEl.replaceChildren();
         const item = document.createElement('li');
         item.textContent = expected === null ? `${best} · WDL unavailable` :
-          `${best} · Expected score ${expected.toFixed(1)}%`;
+          `${best} · ${studyReviewPage() ? 'Best at search depth · ' : ''}Expected score ${expected.toFixed(1)}%`;
         movesEl.appendChild(item);
         showValue(finished.evaluation, game.turn() === 'b');
+        if (botGamePage() && Number.isFinite(finished.evaluation?.cp)) {
+          if (livePending?.postFen === finished.fen && livePending.side !== game.turn()) {
+            const lossCp = livePending.played === livePending.best ? 0 :
+              Math.max(0, livePending.bestCp + finished.evaluation.cp);
+            const playedCp = livePending.bestCp - lossCp;
+            liveReview.push({fen: livePending.fen, postFen: finished.fen,
+              side: livePending.side, played: livePending.played,
+              review: {...qualityFromLoss(lossCp, livePending.bestCp, playedCp,
+                livePending.played === livePending.best), depth: Math.min(livePending.depth,
+                finished.reachedDepth || finished.depth)}});
+            livePending = null;
+          }
+          lastSearchResult = {fen: finished.fen, cp: finished.evaluation.cp, best,
+            depth: finished.reachedDepth || finished.depth};
+          renderReview();
+        }
         drawArrows();
         setStatus(`Stockfish 19 · depth ${finished.reachedDepth || finished.depth} · ${game.turn() === 'b' ? 'Black' : 'White'} to move`);
       } else {
@@ -1462,11 +1695,23 @@
   }
   function publishStreamState() {
     if (!streamerMode || !streamChannel) return;
+    const reviewed = reviewMoveForBoard();
+    const entries = reviewEntries();
+    const totals = reviewSummary(entries);
+    const recent = botGamePage() ? liveReview[liveReview.length - 1] : null;
+    const recentVisual = recent?.review && recent.postFen === game?.fen()
+      ? REVIEW_PALETTE[recent.review.category] : null;
     const state = {type: 'state', status: statusEl.textContent, opening: openingName,
       fen: game?.fen() || '', blackView: board ? isBlackView() : lastBoardOrientation,
       skin: captureBoardSkin(),
-      engineMode, depth, maiaRating, autoPlay, autoNextBot,
-      moves: shownMoves.map(move => ({uci: move.uci, label: move.label, metric: move.metric})),
+      engineMode, depth, maiaRating, autoPlay, autoNextBot, study: studyReviewPage(),
+      moves: (reviewed ? [reviewed] : shownMoves).map(move =>
+        ({uci: move.uci, label: move.label, metric: move.metric, color: move.color, icon: move.icon})),
+      recent: recentVisual ? {uci: recent.played, label: `${recent.review.accuracy.toFixed(0)}%`,
+        color: recentVisual.color, icon: recentVisual.icon} : null,
+      review: studyReviewPage() && entries.some(item => item.review) ? {
+        white: totals.w.count ? totals.w.sum / totals.w.count : null,
+        black: totals.b.count ? totals.b.sum / totals.b.count : null} : null,
       value: shownValue ? [...shownValue] : null};
     const signature = JSON.stringify(state);
     if (signature === lastStreamSignature) return;
@@ -1487,6 +1732,7 @@
     streamPopup = null;
     panel.style.display = '';
     panel.querySelector('#maia-web-streamer').textContent = 'Streamer Mode: OFF';
+    renderReview();
     if (!arrow.isConnected) document.documentElement.appendChild(arrow);
     drawArrows();
   }
@@ -1500,7 +1746,7 @@
     if (!popup) { setStatus('Allow popups for Chess.com, then try Streamer Mode again.'); return; }
     try {
       popup.document.open();
-      popup.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>Chess Engine Streamer View</title>
+      popup.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>Board Studio Streamer View</title>
         <style>body{margin:0;background:#121c28;color:#f6f8fb;font:14px/1.5 system-ui,-apple-system,sans-serif}
         main{padding:16px}h1{margin:0 0 14px;font-size:18px}.row{display:flex;align-items:center;gap:8px;margin:10px 0}
         button{background:#33485d;color:#fff;border:1px solid #708296;border-radius:6px;padding:7px;font:inherit;cursor:pointer}
@@ -1516,12 +1762,12 @@
         #mini-board .white-piece{color:#fff;text-shadow:0 1px 2px #111,1px 0 #111,-1px 0 #111}
         #mini-board .black-piece{color:#182018;text-shadow:0 1px 1px #fff9}
         #mini-arrow{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible}
-        </style></head><body><main><h1>${engineMode === 'maia' ? 'Maia 79M' : 'Stockfish 19'}</h1><div id="status">Connecting…</div>
-        <div id="depth">Depth: 11</div><div id="opening">Opening: —</div><div id="mini-board" aria-label="Current chess position"><svg id="mini-arrow" viewBox="0 0 100 100" aria-hidden="true"></svg></div>
+        </style></head><body><main><h1>${studyReviewPage() ? 'Board Studio' : engineMode === 'maia' ? 'Maia 79M' : 'Stockfish 19'}</h1><div id="status">Connecting…</div>
+        <div id="depth">Depth: 11</div><div id="opening">Opening: —</div><div id="review" hidden></div><div id="mini-board" aria-label="Current chess position"><svg id="mini-arrow" viewBox="0 0 100 100" aria-hidden="true"></svg></div>
         <ol id="moves"></ol><div id="labels"><span>White win —</span><span>Draw —</span><span>Black win —</span></div>
         <div id="bar"><span id="white"></span><span id="draw"></span><span id="black"></span></div>
-        <div class="row"><button id="human">Enable human moves: ${engineMode === 'maia' ? 'ON' : 'OFF'}</button></div>
-        <div class="row"><button id="auto" ${engineMode === 'maia' ? '' : 'hidden'}>Auto-play Maia: ${autoPlay ? 'ON' : 'OFF'}</button></div>
+        <div class="row"><button id="human">${studyReviewPage() ? 'Human style' : 'Enable human moves'}: ${engineMode === 'maia' ? 'ON' : 'OFF'}</button></div>
+        <div class="row"><button id="auto" ${engineMode === 'maia' ? '' : 'hidden'}>${studyReviewPage() ? 'Auto-play' : 'Auto-play Maia'}: ${autoPlay ? 'ON' : 'OFF'}</button></div>
         <div class="row"><button id="next" ${engineMode === 'maia' ? '' : 'hidden'}>Auto next bot game: ${autoNextBot ? 'ON' : 'OFF'}</button></div>
         <div class="row"><button id="off">Streamer Mode: ON · Turn off</button></div></main></body></html>`);
       popup.document.close();
@@ -1545,17 +1791,22 @@
       popupChannel.onmessage = event => {
         if (event.data?.type !== 'state' || popup.closed) return;
         const state = event.data;
-        popup.document.querySelector('h1').textContent = state.engineMode === 'maia' ? 'Maia 79M · Human moves' : 'Stockfish 19';
-        popup.document.getElementById('human').textContent = `Enable human moves: ${state.engineMode === 'maia' ? 'ON' : 'OFF'}`;
+        popup.document.querySelector('h1').textContent = state.study ? 'Board Studio' :
+          state.engineMode === 'maia' ? 'Maia 79M · Human moves' : 'Stockfish 19';
+        popup.document.getElementById('human').textContent = `${state.study ? 'Human style' : 'Enable human moves'}: ${state.engineMode === 'maia' ? 'ON' : 'OFF'}`;
         popup.document.getElementById('auto').hidden = state.engineMode !== 'maia';
-        popup.document.getElementById('auto').textContent = `Auto-play Maia: ${state.autoPlay ? 'ON' : 'OFF'}`;
+        popup.document.getElementById('auto').textContent = `${state.study ? 'Auto-play' : 'Auto-play Maia'}: ${state.autoPlay ? 'ON' : 'OFF'}`;
         popup.document.getElementById('next').hidden = state.engineMode !== 'maia';
         popup.document.getElementById('next').textContent = `Auto next bot game: ${state.autoNextBot ? 'ON' : 'OFF'}`;
         popup.document.getElementById('status').textContent = state.status;
         popup.document.getElementById('depth').textContent = state.engineMode === 'maia'
-          ? `Maia rating: ${state.maiaRating} · single pass` : `Depth: ${state.depth}`;
+          ? `${state.study ? 'Human rating' : 'Maia rating'}: ${state.maiaRating} · single pass` : `Depth: ${state.depth}`;
         popup.document.getElementById('opening').textContent = `Opening: ${state.opening || '—'}`;
-        renderMiniBoard(popup.document, state.fen, state.blackView, state.moves[0], state.skin);
+        const reviewLine = popup.document.getElementById('review');
+        reviewLine.hidden = !state.review;
+        const formatReview = value => value === null ? '—' : `${value.toFixed(1)}%`;
+        reviewLine.textContent = state.review ? `Review accuracy · White ${formatReview(state.review.white)} · Black ${formatReview(state.review.black)}` : '';
+        renderMiniBoard(popup.document, state.fen, state.blackView, state.moves[0], state.skin, state.recent);
         const list = popup.document.getElementById('moves');
         list.replaceChildren();
         for (const move of state.moves.slice(0, 1)) {
@@ -1577,6 +1828,7 @@
       popup.document.getElementById('off').addEventListener('click', () => popupChannel.postMessage({type: 'off'}));
       streamPopup = popup;
       streamerMode = true;
+      boardReview.hidden = true;
       saveSetting('streamer', 'true');
       try { localStorage.setItem('stockfish-streamer-active', 'true'); }
       catch { /* Private browsing may disable storage. */ }
@@ -1599,17 +1851,26 @@
   }
   function syncEngineUi() {
     const maia = engineMode === 'maia';
-    humanButton.textContent = `Enable human moves: ${maia ? 'ON' : 'OFF'}`;
-    autoButton.textContent = `Auto-play Maia: ${autoPlay ? 'ON' : 'OFF'}`;
+    const study = studyReviewPage();
+    humanButton.textContent = `${study ? 'Human style' : 'Enable human moves'}: ${maia ? 'ON' : 'OFF'}`;
+    humanButton.title = study ? 'Choose human probability model or precision search' : 'Switch between Maia 3 and Stockfish 19';
+    autoButton.textContent = `${study ? 'Auto-play' : 'Auto-play Maia'}: ${autoPlay ? 'ON' : 'OFF'}`;
+    autoSideEl.setAttribute('aria-label', study ? 'Side for auto-play' : 'Side for Maia auto-play');
     nextButton.textContent = `Auto next bot game: ${autoNextBot ? 'ON' : 'OFF'}`;
     panel.querySelector('#maia-web-auto-row').hidden = !maia;
     panel.querySelector('#maia-web-next-row').hidden = !maia;
-    panel.querySelector('#maia-web-head span').textContent = maia ? 'Maia 79M · Human moves' : 'Stockfish 19';
+    panel.querySelector('#maia-web-head span').textContent = study ? 'Board Studio' :
+      maia ? 'Maia 79M · Human moves' : 'Stockfish 19';
     panel.querySelector('#maia-web-stockfish-settings').hidden = maia;
     panel.querySelector('#maia-web-stockfish-strength').hidden = maia;
     panel.querySelector('#maia-web-maia-settings').hidden = !maia;
     panel.querySelector('#maia-web-maia-note').hidden = !maia;
-    panel.querySelector('#maia-web-retry').textContent = maia ? 'Load Maia' : 'Retry engine';
+    panel.querySelector('#maia-web-maia-settings label').textContent = study ? 'Human rating' : 'Maia rating';
+    panel.querySelector('#maia-web-maia-note').textContent = study ?
+      'Probability model · one pass; no search depth' : 'Maia 79M · one prediction pass; no search depth';
+    panel.querySelector('#maia-web-stockfish-strength').textContent = study ?
+      'Maximum search · Elo varies' : 'Full build · Max skill · Elo varies';
+    panel.querySelector('#maia-web-retry').textContent = maia ? (study ? 'Load model' : 'Load Maia') : 'Retry analysis';
     publishStreamState();
   }
   humanButton.addEventListener('click', () => {
@@ -1619,6 +1880,8 @@
       saveSetting('engine', engineMode);
       maiaGeneration++;
       stopStockfishEngine();
+      livePending = null;
+      lastSearchResult = null;
       autoPlayedFen = '';
       clearPrediction();
       syncEngineUi();
@@ -1747,7 +2010,7 @@
   new MutationObserver(mutations => {
     if (mutations.some(m => {
       const el = m.target.nodeType === 1 ? m.target : m.target.parentElement;
-      return el && !el.closest('#maia-web-panel, #maia-web-arrow');
+      return el && !el.closest('#maia-web-panel, #maia-web-arrow, #maia-web-board-review');
     })) scheduleScan();
   }).observe(document.documentElement, {
     subtree: true, childList: true, characterData: true, attributes: true,
