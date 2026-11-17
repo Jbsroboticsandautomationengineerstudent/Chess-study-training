@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stockfish 19 / Maia 3 Chess Board Assistant
 // @namespace    https://github.com/Jbsroboticsandautomationengineerstudent/Chess-study-training
-// @version      1.4.0
+// @version      1.4.1
 // @description  Switchable Stockfish 19 and Maia 3 board analysis
 // @match        https://www.chess.com/*
 // @match        https://chess.com/*
@@ -83,6 +83,8 @@
   let depth = Math.max(10, Math.min(25, Number(readSetting('stockfish-depth') ?? 11) || 11));
   let autoPlay = readSetting('maia-autoplay') === 'true';
   let autoPlayedFen = '';
+  let autoPlayTimer = 0;
+  let autoPlayToken = 0;
   let activeSearch = null;
   let pendingSearch = null;
   let researchJob = null;
@@ -210,6 +212,8 @@
   }
   function clearPrediction() {
     inferenceId++;
+    clearTimeout(autoPlayTimer);
+    autoPlayToken++;
     if (activeSearch && worker) {
       activeSearch.stale = true;
       worker.postMessage('stop');
@@ -457,6 +461,19 @@
   function autoPlayablePage() {
     return /^\/(?:play|game)\//.test(location.pathname);
   }
+  function botThinkingDelay() {
+    if (!/^\/play\/computer(?:\/|$)/.test(location.pathname)) return 0;
+    // A bounded illustrative clock density: t0 + lognormal noise. Its parameters
+    // are not fitted to human games, so this is a bot-game pace control only.
+    const choices = Math.min(40, game?.moves().length || 20);
+    const displayedProbability = parseFloat(shownMoves[0]?.label);
+    const probability = Number.isFinite(displayedProbability)
+      ? Math.max(0, Math.min(1, displayedProbability / 100)) : 0.5;
+    const median = 1800 + choices * 35 + (1 - probability) * 1000;
+    const u = Math.max(Number.EPSILON, Math.random());
+    const z = Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * Math.random());
+    return Math.round(Math.max(1800, Math.min(7500, 700 + median * Math.exp(0.3 * z))));
+  }
   function autoSide() {
     return autoSideEl.value === 'bottom' ? (isBlackView() ? 'b' : 'w') : autoSideEl.value;
   }
@@ -509,8 +526,14 @@
         activeSearch || pendingSearch || !board ||
         game?.turn() !== autoSide() || autoPlayedFen === fen) return;
     autoPlayedFen = fen; // One attempt per position, even if the site ignores synthetic events.
-    setTimeout(() => {
-      if (engineMode !== 'maia' || !autoPlay || !autoPlayablePage() || researchJob || game?.fen() !== fen ||
+    const delay = botThinkingDelay();
+    const token = ++autoPlayToken;
+    if (delay) setStatus(`Maia move ready · bot pace ${(delay / 1000).toFixed(1)}s`);
+    clearTimeout(autoPlayTimer);
+    autoPlayTimer = setTimeout(() => {
+      autoPlayTimer = 0;
+      if (token !== autoPlayToken || engineMode !== 'maia' || !autoPlay || !autoPlayablePage() ||
+          researchJob || game?.fen() !== fen ||
           shownMoves[0]?.uci !== uci || !board?.isConnected) return;
       const moved = clickBoardSquare(uci.slice(0, 2)) && clickBoardSquare(uci.slice(2, 4));
       if (!moved) { setStatus('Auto-play could not reach the board. Move manually.'); return; }
@@ -527,7 +550,7 @@
         if (engineMode === 'maia' && autoPlay && game?.fen() === fen)
           setStatus('Chess.com did not accept the automatic move. Move manually.');
       }, 1200);
-    }, 0);
+    }, delay);
   }
 
   // Square coordinates use file X and rank Y, independent of rotation.
@@ -1577,11 +1600,15 @@
     autoPlay = !autoPlay;
     saveSetting('maia-autoplay', autoPlay);
     syncEngineUi();
+    clearTimeout(autoPlayTimer);
+    autoPlayToken++;
     autoPlayedFen = '';
     if (autoPlay && game && shownMoves[0]) maybeAutoPlay(game.fen(), shownMoves[0].uci);
   });
   autoSideEl.addEventListener('change', () => {
     saveSetting('maia-auto-side', autoSideEl.value);
+    clearTimeout(autoPlayTimer);
+    autoPlayToken++;
     autoPlayedFen = '';
     if (autoPlay && game && shownMoves[0]) maybeAutoPlay(game.fen(), shownMoves[0].uci);
   });
