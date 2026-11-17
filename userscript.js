@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Stockfish 19 Chess Board Assistant
+// @name         Stockfish 19 / Maia 3 Chess Board Assistant
 // @namespace    https://github.com/Jbsroboticsandautomationengineerstudent/Chess-study-training
-// @version      1.3.2
+// @version      1.4.0
 // @description  Switchable Stockfish 19 and Maia 3 board analysis
 // @match        https://www.chess.com/*
 // @match        https://chess.com/*
@@ -14,6 +14,8 @@
 // @connect      cas-bridge.xethub.hf.co
 // @connect      cdn-lfs.hf.co
 // @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
 // ==/UserScript==
 
 (async () => {
@@ -35,6 +37,27 @@
     return;
   }
 
+  function readSetting(name) {
+    const key = `chess-assistant-${name}`;
+    try {
+      if (typeof GM_getValue === 'function') {
+        const value = GM_getValue(key, null);
+        if (typeof value === 'string') return value;
+      }
+    } catch { /* Use page storage if the manager has no value store. */ }
+    try { return localStorage.getItem(key); }
+    catch { return null; }
+  }
+  function saveSetting(name, value) {
+    const key = `chess-assistant-${name}`;
+    try {
+      if (typeof GM_setValue === 'function')
+        Promise.resolve(GM_setValue(key, String(value))).catch(() => {});
+    } catch { /* Keep using page storage. */ }
+    try { localStorage.setItem(key, String(value)); }
+    catch { /* Private browsing may disable page storage. */ }
+  }
+
   const START_PLACEMENT = new ChessClass().fen().split(' ')[0];
   let board = null;
   let game = null;
@@ -46,18 +69,19 @@
   let engineError = '';
   let engineCached = false;
   let cacheAvailable = true;
-  let engineMode = 'stockfish';
+  let engineMode = readSetting('engine') === 'maia' ? 'maia' : 'stockfish';
   let engineGeneration = 0;
   let maiaGeneration = 0;
   let maiaSession = null;
   let maiaLoading = null;
+  let maiaDownloadController = null;
   let maiaRun = null;
   let maiaError = '';
   let maiaBackend = '';
-  let maiaRating = 2600;
+  let maiaRating = Math.max(600, Math.min(2600, Number(readSetting('maia-rating') ?? 2600) || 2600));
   let inferenceId = 0;
-  let depth = 11;
-  let autoPlay = false;
+  let depth = Math.max(10, Math.min(25, Number(readSetting('stockfish-depth') ?? 11) || 11));
+  let autoPlay = readSetting('maia-autoplay') === 'true';
   let autoPlayedFen = '';
   let activeSearch = null;
   let pendingSearch = null;
@@ -69,7 +93,7 @@
   let missedBoard = '';
   let missedCount = 0;
   let scanTimer = 0;
-  let flipOverride = false;
+  let flipOverride = readSetting('flip') === 'true';
   let shownMoves = [];
   let shownValue = null;
   let streamerMode = false;
@@ -126,13 +150,13 @@
   panel.innerHTML = `
     <div id="maia-web-head"><span>Stockfish 19</span><span>drag</span></div>
     <div class="body">
-      <div class="row"><button id="maia-web-human" title="Maia human-like predictions on bot and analysis boards">Enable human moves: OFF</button></div>
+      <div class="row"><button id="maia-web-human" title="Switch between Maia 3 and Stockfish 19">Enable human moves: OFF</button></div>
       <div class="row" id="maia-web-stockfish-settings"><label for="maia-web-depth">Depth</label><input id="maia-web-depth" type="range" min="10" max="25" value="11"><span id="maia-web-depth-label">11</span></div>
       <div class="row" id="maia-web-stockfish-strength" title="Full single-threaded build; no strength handicap. Elo is not fixed by depth.">Full build · Max skill · Elo varies</div>
       <div class="row" id="maia-web-maia-settings" hidden><label for="maia-web-rating">Maia rating</label><input id="maia-web-rating" type="range" min="600" max="2600" step="100" value="2600"><span id="maia-web-rating-label">2600</span></div>
       <div class="row" id="maia-web-maia-note" hidden>Maia 79M · one prediction pass; no search depth</div>
-      <div class="row"><button id="maia-web-autoplay">Auto-play bots: OFF</button>
-        <select id="maia-web-auto-side" aria-label="Side for bot auto-play"><option value="bottom">Bottom side</option><option value="w">White</option><option value="b">Black</option></select></div>
+      <div class="row" id="maia-web-auto-row" hidden><button id="maia-web-autoplay">Auto-play Maia: OFF</button>
+        <select id="maia-web-auto-side" aria-label="Side for Maia auto-play"><option value="bottom">Bottom side</option><option value="w">White</option><option value="b">Black</option></select></div>
       <div class="row"><button id="maia-web-flip" title="Reverse arrow orientation">Flip</button></div>
       <div id="maia-web-status">Finding board…</div>
       <div id="maia-web-opening">Opening: —</div>
@@ -430,11 +454,8 @@
     arrow.style.display = 'block';
     keepArrowAligned();
   }
-  function botAutoPlayAllowed() {
-    return /^\/play\/computer(?:\/|$)/.test(location.pathname);
-  }
-  function maiaBoardAllowed() {
-    return botAutoPlayAllowed() || /^\/analysis(?:\/|$)/.test(location.pathname);
+  function autoPlayablePage() {
+    return /^\/(?:play|game)\//.test(location.pathname);
   }
   function autoSide() {
     return autoSideEl.value === 'bottom' ? (isBlackView() ? 'b' : 'w') : autoSideEl.value;
@@ -484,17 +505,18 @@
     }
   }
   function maybeAutoPlay(fen, uci) {
-    if (!autoPlay || !botAutoPlayAllowed() || researchJob || activeSearch || pendingSearch || !board ||
+    if (engineMode !== 'maia' || !autoPlay || !autoPlayablePage() || researchJob ||
+        activeSearch || pendingSearch || !board ||
         game?.turn() !== autoSide() || autoPlayedFen === fen) return;
     autoPlayedFen = fen; // One attempt per position, even if the site ignores synthetic events.
     setTimeout(() => {
-      if (!autoPlay || !botAutoPlayAllowed() || researchJob || game?.fen() !== fen ||
+      if (engineMode !== 'maia' || !autoPlay || !autoPlayablePage() || researchJob || game?.fen() !== fen ||
           shownMoves[0]?.uci !== uci || !board?.isConnected) return;
       const moved = clickBoardSquare(uci.slice(0, 2)) && clickBoardSquare(uci.slice(2, 4));
       if (!moved) { setStatus('Auto-play could not reach the board. Move manually.'); return; }
       if (uci.length === 5) setTimeout(() => choosePromotion(uci), 50);
       setTimeout(() => {
-        if (autoPlay && botAutoPlayAllowed() && game?.fen() === fen &&
+        if (engineMode === 'maia' && autoPlay && autoPlayablePage() && game?.fen() === fen &&
             piecesFrom(board) === fen.split(' ')[0]) {
           dragBoardMove(uci);
           if (uci.length === 5) setTimeout(() => choosePromotion(uci), 50);
@@ -502,7 +524,7 @@
       }, 450);
       setTimeout(() => {
         scan();
-        if (autoPlay && game?.fen() === fen)
+        if (engineMode === 'maia' && autoPlay && game?.fen() === fen)
           setStatus('Chess.com did not accept the automatic move. Move manually.');
       }, 1200);
     }, 0);
@@ -677,10 +699,7 @@
     const fen = game.fen();
     if (fenEl.textContent !== fen) fenEl.textContent = fen;
     if (engineMode === 'maia') {
-      if (!maiaBoardAllowed()) {
-        if (shownMoves.length) clearPrediction();
-        setStatus('Maia human-move hints are available on bot games and analysis boards.');
-      } else if (maiaSession) void predictMaia(fen);
+      if (maiaSession) void predictMaia(fen);
       else if (maiaError) setStatus(maiaError);
     } else if (engineReady && !researchJob) requestAnalysis(fen);
     else if (engineError) setStatus(engineError);
@@ -788,11 +807,17 @@
       if (blob && blob.size < MAIA_MODEL_MIN_BYTES) blob = null;
       if (!blob) {
         setStatus('Downloading Maia 79M model…');
-        blob = await downloadAsset(MAIA_MODEL_URL, (loaded, total) => {
-          if (generation !== maiaGeneration) return;
-          const size = total > 0 && loaded <= total ? total : 313_000_000;
-          setStatus(`Downloading Maia 79M: ${Math.min(100, Math.floor(100 * loaded / size))}% (${(loaded / 1e6).toFixed(0)} MB)`);
-        });
+        const controller = new AbortController();
+        maiaDownloadController = controller;
+        try {
+          blob = await downloadAsset(MAIA_MODEL_URL, (loaded, total) => {
+            if (generation !== maiaGeneration) return;
+            const size = total > 0 && loaded <= total ? total : 313_000_000;
+            setStatus(`Downloading Maia 79M: ${Math.min(100, Math.floor(100 * loaded / size))}% (${(loaded / 1e6).toFixed(0)} MB)`);
+          }, controller.signal);
+        } finally {
+          if (maiaDownloadController === controller) maiaDownloadController = null;
+        }
         if (blob.size < MAIA_MODEL_MIN_BYTES) throw new Error('Maia model download was incomplete.');
         if (generation === maiaGeneration) {
           setStatus('Saving Maia 79M model…');
@@ -833,7 +858,7 @@
     return maiaLoading;
   }
   async function predictMaia(fen) {
-    if (engineMode !== 'maia' || !maiaBoardAllowed() || !maiaSession || maiaRun || !game || fen === lastFen) return;
+    if (engineMode !== 'maia' || !maiaSession || maiaRun || !game || fen === lastFen) return;
     lastFen = fen;
     const id = ++inferenceId;
     const legal = game.moves({verbose: true});
@@ -849,7 +874,7 @@
       run = maiaSession.run(feeds);
       maiaRun = run;
       const output = await run;
-      if (id !== inferenceId || engineMode !== 'maia' || !maiaBoardAllowed() || game?.fen() !== fen) return;
+      if (id !== inferenceId || engineMode !== 'maia' || game?.fen() !== fen) return;
       const logits = (output.logits_move || output.move_logits)?.data;
       if (!logits || logits.length < 4352) throw new Error('Expected 4352 Maia move logits.');
       const black = game.turn() === 'b';
@@ -1145,7 +1170,6 @@
         showValue(finished.evaluation, game.turn() === 'b');
         drawArrows();
         setStatus(`Stockfish 19 · depth ${finished.reachedDepth || finished.depth} · ${game.turn() === 'b' ? 'Black' : 'White'} to move`);
-        maybeAutoPlay(finished.fen, best);
       } else {
         clearPrediction();
         setStatus(best === undefined ? 'No legal moves.' : 'Stockfish returned an invalid move. Rescanning…');
@@ -1155,22 +1179,40 @@
     if (researchJob) beginPostgamePosition();
     else beginSearch();
   }
-  function downloadAsset(url, onProgress) {
+  function downloadAsset(url, onProgress, signal) {
+    if (signal?.aborted) return Promise.reject(new Error('Download cancelled'));
     if (typeof GM_xmlhttpRequest !== 'function') {
-      return fetch(url).then(response => {
+      return fetch(url, {signal}).then(response => {
         if (!response.ok) throw new Error(`HTTP ${response.status} while downloading ${url}`);
         return response.blob();
       });
     }
-    return new Promise((resolve, reject) => GM_xmlhttpRequest({
-      method: 'GET', url, responseType: 'blob',
-      onprogress: event => onProgress?.(event.loaded, event.total),
-      onload: response => response.status >= 200 && response.status < 300 && response.response
-        ? resolve(response.response)
-        : reject(new Error(`HTTP ${response.status} while downloading ${url}`)),
-      onerror: () => reject(new Error(`Network error while downloading ${url}`)),
-      ontimeout: () => reject(new Error(`Timed out while downloading ${url}`))
-    }));
+    return new Promise((resolve, reject) => {
+      let request;
+      let settled = false;
+      const finish = (callback, value) => {
+        if (settled) return;
+        settled = true;
+        signal?.removeEventListener('abort', abort);
+        callback(value);
+      };
+      const abort = () => {
+        try { request?.abort?.(); } catch { /* The request may already have ended. */ }
+        finish(reject, new Error('Download cancelled'));
+      };
+      signal?.addEventListener('abort', abort, {once: true});
+      request = GM_xmlhttpRequest({
+        method: 'GET', url, responseType: 'blob',
+        onprogress: event => onProgress?.(event.loaded, event.total),
+        onload: response => response.status >= 200 && response.status < 300 && response.response
+          ? finish(resolve, response.response)
+          : finish(reject, new Error(`HTTP ${response.status} while downloading ${url}`)),
+        onerror: () => finish(reject, new Error(`Network error while downloading ${url}`)),
+        ontimeout: () => finish(reject, new Error(`Timed out while downloading ${url}`)),
+        onabort: () => finish(reject, new Error('Download cancelled'))
+      });
+      if (signal?.aborted) abort();
+    });
   }
   function openEngineCache() {
     return new Promise((resolve, reject) => {
@@ -1349,7 +1391,8 @@
     const state = {type: 'state', status: statusEl.textContent, opening: openingName,
       fen: game?.fen() || '', blackView: board ? isBlackView() : lastBoardOrientation,
       skin: captureBoardSkin(),
-      engineMode, depth, maiaRating, moves: shownMoves.map(move => ({uci: move.uci, label: move.label, metric: move.metric})),
+      engineMode, depth, maiaRating, autoPlay,
+      moves: shownMoves.map(move => ({uci: move.uci, label: move.label, metric: move.metric})),
       value: shownValue ? [...shownValue] : null};
     const signature = JSON.stringify(state);
     if (signature === lastStreamSignature) return;
@@ -1359,6 +1402,7 @@
   function stopStreamerMode() {
     if (!streamerMode) return;
     streamerMode = false;
+    saveSetting('streamer', 'false');
     try { localStorage.setItem('stockfish-streamer-active', 'false'); }
     catch { /* Private browsing may disable storage. */ }
     lastStreamSignature = '';
@@ -1403,6 +1447,7 @@
         <ol id="moves"></ol><div id="labels"><span>White win —</span><span>Draw —</span><span>Black win —</span></div>
         <div id="bar"><span id="white"></span><span id="draw"></span><span id="black"></span></div>
         <div class="row"><button id="human">Enable human moves: ${engineMode === 'maia' ? 'ON' : 'OFF'}</button></div>
+        <div class="row"><button id="auto" ${engineMode === 'maia' ? '' : 'hidden'}>Auto-play Maia: ${autoPlay ? 'ON' : 'OFF'}</button></div>
         <div class="row"><button id="off">Streamer Mode: ON · Turn off</button></div></main></body></html>`);
       popup.document.close();
       const miniBoard = popup.document.getElementById('mini-board');
@@ -1419,12 +1464,15 @@
       streamChannel.onmessage = event => {
         if (event.data?.type === 'off') stopStreamerMode();
         if (event.data?.type === 'engine-toggle') humanButton.click();
+        if (event.data?.type === 'auto-toggle') autoButton.click();
       };
       popupChannel.onmessage = event => {
         if (event.data?.type !== 'state' || popup.closed) return;
         const state = event.data;
         popup.document.querySelector('h1').textContent = state.engineMode === 'maia' ? 'Maia 79M · Human moves' : 'Stockfish 19';
         popup.document.getElementById('human').textContent = `Enable human moves: ${state.engineMode === 'maia' ? 'ON' : 'OFF'}`;
+        popup.document.getElementById('auto').hidden = state.engineMode !== 'maia';
+        popup.document.getElementById('auto').textContent = `Auto-play Maia: ${state.autoPlay ? 'ON' : 'OFF'}`;
         popup.document.getElementById('status').textContent = state.status;
         popup.document.getElementById('depth').textContent = state.engineMode === 'maia'
           ? `Maia rating: ${state.maiaRating} · single pass` : `Depth: ${state.depth}`;
@@ -1446,9 +1494,11 @@
         });
       };
       popup.document.getElementById('human').addEventListener('click', () => popupChannel.postMessage({type: 'engine-toggle'}));
+      popup.document.getElementById('auto').addEventListener('click', () => popupChannel.postMessage({type: 'auto-toggle'}));
       popup.document.getElementById('off').addEventListener('click', () => popupChannel.postMessage({type: 'off'}));
       streamPopup = popup;
       streamerMode = true;
+      saveSetting('streamer', 'true');
       try { localStorage.setItem('stockfish-streamer-active', 'true'); }
       catch { /* Private browsing may disable storage. */ }
       arrow.replaceChildren();
@@ -1471,6 +1521,8 @@
   function syncEngineUi() {
     const maia = engineMode === 'maia';
     humanButton.textContent = `Enable human moves: ${maia ? 'ON' : 'OFF'}`;
+    autoButton.textContent = `Auto-play Maia: ${autoPlay ? 'ON' : 'OFF'}`;
+    panel.querySelector('#maia-web-auto-row').hidden = !maia;
     panel.querySelector('#maia-web-head span').textContent = maia ? 'Maia 79M · Human moves' : 'Stockfish 19';
     panel.querySelector('#maia-web-stockfish-settings').hidden = maia;
     panel.querySelector('#maia-web-stockfish-strength').hidden = maia;
@@ -1482,11 +1534,8 @@
   humanButton.addEventListener('click', () => {
     if (researchJob) { setStatus('Finish or cancel post-game research before switching engines.'); return; }
     if (engineMode === 'stockfish') {
-      if (!maiaBoardAllowed()) {
-        setStatus('Maia human-move hints are available on bot games and analysis boards.');
-        return;
-      }
       engineMode = 'maia';
+      saveSetting('engine', engineMode);
       maiaGeneration++;
       stopStockfishEngine();
       autoPlayedFen = '';
@@ -1495,21 +1544,26 @@
       void loadMaia();
     } else {
       engineMode = 'stockfish';
+      saveSetting('engine', engineMode);
       maiaGeneration++;
+      maiaDownloadController?.abort();
+      maiaDownloadController = null;
       const session = maiaSession;
       maiaSession = null;
       const running = maiaRun;
+      const loading = maiaLoading;
       autoPlayedFen = '';
       clearPrediction();
       syncEngineUi();
       setStatus('Switching to Stockfish 19…');
-      Promise.resolve(running).catch(() => {}).then(() => session?.release?.())
+      Promise.allSettled([running, loading]).then(() => session?.release?.())
         .catch(error => console.warn('[Maia] Session release failed:', error))
         .finally(() => { if (engineMode === 'stockfish') { startEngine(); scan(); } });
     }
   });
   ratingEl.addEventListener('input', () => {
     maiaRating = Math.max(600, Math.min(2600, Number(ratingEl.value) || 2600));
+    saveSetting('maia-rating', maiaRating);
     ratingLabelEl.textContent = String(maiaRating);
     if (engineMode === 'maia') { autoPlayedFen = ''; clearPrediction(); scan(); }
     publishStreamState();
@@ -1519,16 +1573,15 @@
     else startEngine();
   });
   autoButton.addEventListener('click', () => {
-    if (!autoPlay && !botAutoPlayAllowed()) {
-      setStatus('Auto-play is available only on Chess.com bot games (/play/computer).');
-      return;
-    }
+    if (engineMode !== 'maia') return;
     autoPlay = !autoPlay;
-    autoButton.textContent = `Auto-play bots: ${autoPlay ? 'ON' : 'OFF'}`;
+    saveSetting('maia-autoplay', autoPlay);
+    syncEngineUi();
     autoPlayedFen = '';
     if (autoPlay && game && shownMoves[0]) maybeAutoPlay(game.fen(), shownMoves[0].uci);
   });
   autoSideEl.addEventListener('change', () => {
+    saveSetting('maia-auto-side', autoSideEl.value);
     autoPlayedFen = '';
     if (autoPlay && game && shownMoves[0]) maybeAutoPlay(game.fen(), shownMoves[0].uci);
   });
@@ -1551,6 +1604,7 @@
   });
   depthEl.addEventListener('input', () => {
     depth = Math.max(10, Math.min(25, Number(depthEl.value) || 11));
+    saveSetting('stockfish-depth', depth);
     depthLabelEl.textContent = String(depth);
     if (engineMode === 'stockfish') {
       autoPlayedFen = '';
@@ -1564,6 +1618,7 @@
   });
   panel.querySelector('#maia-web-flip').addEventListener('click', () => {
     flipOverride = !flipOverride;
+    saveSetting('flip', flipOverride);
     drawArrows();
     autoPlayedFen = '';
     if (autoPlay && game && shownMoves[0]) maybeAutoPlay(game.fen(), shownMoves[0].uci);
@@ -1612,12 +1667,22 @@
   document.addEventListener('visibilitychange', () => { if (!document.hidden) scheduleScan(); });
   setInterval(() => { if (streamerMode && streamPopup?.closed) stopStreamerMode(); }, 500);
   setInterval(scan, 300);
+  depthEl.value = String(depth);
+  depthLabelEl.textContent = String(depth);
+  ratingEl.value = String(maiaRating);
+  ratingLabelEl.textContent = String(maiaRating);
+  const savedAutoSide = readSetting('maia-auto-side');
+  autoSideEl.value = ['bottom', 'w', 'b'].includes(savedAutoSide) ? savedAutoSide : 'bottom';
+  syncEngineUi();
   scan();
-  startEngine();
+  if (engineMode === 'maia') void loadMaia();
+  else startEngine();
   try {
+    const savedSharedStreamer = readSetting('streamer');
     const savedStreamerState = localStorage.getItem('stockfish-streamer-active');
-    if (savedStreamerState === 'true' ||
-        (savedStreamerState === null && localStorage.getItem('maia-streamer-active') === 'true'))
+    if (savedSharedStreamer === 'true' || (savedSharedStreamer === null &&
+        (savedStreamerState === 'true' ||
+          (savedStreamerState === null && localStorage.getItem('maia-streamer-active') === 'true'))))
       setTimeout(startStreamerMode, 400);
   } catch { /* Keep manual mode available when storage is disabled. */ }
 })();
