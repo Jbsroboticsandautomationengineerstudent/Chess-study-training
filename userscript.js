@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stockfish 19 / Maia 3 Chess Board Assistant
 // @namespace    https://github.com/Jbsroboticsandautomationengineerstudent/Chess-study-training
-// @version      1.5.5
+// @version      1.5.6
 // @description  Switchable Stockfish 19 and Maia 3 board analysis
 // @match        https://www.chess.com/*
 // @match        https://chess.com/*
@@ -33,11 +33,11 @@
   const MAX_BOARD_ARROWS = 10;
   const TOP_MOVE_COLORS = ['#00008A', '#3273b7', '#7fa7d1'];
   const REVIEW_PALETTE = {
-    Brilliant: {color: '#28c9bd', icon: '!!'}, Great: {color: '#6f9fca', icon: '!'},
-    Best: {color: '#78b847', icon: '★'}, Excellent: {color: '#93bf5c', icon: '👍'},
-    Good: {color: '#76ae70', icon: '✓'}, Book: {color: '#b7976e', icon: '📖'},
-    Inaccuracy: {color: '#e2c145', icon: '?!'}, Mistake: {color: '#e69b58', icon: '?'},
-    Miss: {color: '#dc6968', icon: '×'}, Blunder: {color: '#d6534f', icon: '??'}
+    Brilliant: {color: '#28c0a0', icon: '!!'}, Great: {color: '#7098c0', icon: '!'},
+    Best: {color: '#80b050', icon: '★'}, Excellent: {color: '#84b450', icon: '👍'},
+    Good: {color: '#90b878', icon: '✓'}, Book: {color: '#c8a078', icon: '📖'},
+    Inaccuracy: {color: '#e8c040', icon: '?!'}, Mistake: {color: '#f0a060', icon: '?'},
+    Miss: {color: '#e87868', icon: '×'}, Blunder: {color: '#e84838', icon: '??'}
   };
   const CATEGORY_ORDER = ['Great', 'Best', 'Excellent', 'Good', 'Book',
     'Inaccuracy', 'Mistake', 'Miss', 'Blunder', 'Brilliant'];
@@ -336,11 +336,13 @@
   function makeReviewBadge(doc, move) {
     const badge = doc.createElementNS(svgNS, 'svg');
     badge.setAttribute('viewBox', '0 0 32 32');
-    badge.setAttribute('aria-label', move.category || 'Move quality');
+    badge.setAttribute('aria-label', move.category || `Suggestion ${move.rank || ''}`.trim());
     const circle = doc.createElementNS(svgNS, 'circle');
     for (const [name, value] of Object.entries({cx: 16, cy: 16, r: 15,
       fill: move.color || REVIEW_PALETTE[move.category]?.color || '#789'}))
       circle.setAttribute(name, value);
+    circle.setAttribute('stroke', '#ffffff55');
+    circle.setAttribute('stroke-width', '1');
     badge.appendChild(circle);
     if (move.category === 'Book' || move.category === 'Excellent') {
       const path = doc.createElementNS(svgNS, 'path');
@@ -354,10 +356,11 @@
       badge.appendChild(path);
     } else {
       const text = doc.createElementNS(svgNS, 'text');
+      const symbol = move.icon || REVIEW_PALETTE[move.category]?.icon || String(move.rank || '');
       for (const [name, value] of Object.entries({x: 16, y: 22, 'text-anchor': 'middle',
-        'font-size': (move.icon || '').length > 1 ? 16 : 21, 'font-weight': 800,
+        'font-size': symbol.length > 1 ? 16 : 21, 'font-weight': 800,
         'font-family': 'system-ui,sans-serif', fill: '#fff'})) text.setAttribute(name, value);
-      text.textContent = move.icon || REVIEW_PALETTE[move.category]?.icon || '';
+      text.textContent = symbol;
       badge.appendChild(text);
     }
     return badge;
@@ -383,10 +386,10 @@
     tip.setAttribute('fill', color);
     tip.setAttribute('fill-opacity', opacity);
     svg.appendChild(tip);
-    if (move.icon) {
+    if (move.icon || move.rank) {
       const badge = makeReviewBadge(doc, move);
-      for (const [name, value] of Object.entries({x: b.x - 2.6, y: b.y - 6.1,
-        width: 5.2, height: 5.2, opacity})) badge.setAttribute(name, value);
+      for (const [name, value] of Object.entries({x: b.x + 1.1, y: b.y - 5.7,
+        width: 3.4, height: 3.4, opacity})) badge.setAttribute(name, value);
       svg.appendChild(badge);
     }
     const label = doc.createElementNS(svgNS, 'text');
