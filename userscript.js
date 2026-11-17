@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stockfish 19 / Maia 3 Chess Board Assistant
 // @namespace    https://github.com/Jbsroboticsandautomationengineerstudent/Chess-study-training
-// @version      1.5.6
+// @version      1.5.7
 // @description  Switchable Stockfish 19 and Maia 3 board analysis
 // @match        https://www.chess.com/*
 // @match        https://chess.com/*
@@ -50,6 +50,18 @@
     Miss: 'A winning +150 cp position falls to 0 or worse after a 160-300 cp loss',
     Blunder: 'Evaluation loss greater than 300 cp'
   };
+  const MAIA_REVIEW_RULES = {
+    Brilliant: 'Unavailable: needs verified sacrifice analysis',
+    Great: 'Best displayed move with a large Maia outcome advantage over second place',
+    Best: 'Best displayed move or model score loss up to 0.5 percentage points',
+    Excellent: 'Model score loss up to 2 percentage points',
+    Good: 'Model score loss up to 5 percentage points',
+    Book: 'Unavailable: needs an opening book',
+    Inaccuracy: 'Model score loss up to 10 percentage points',
+    Mistake: 'Model score loss up to 20 percentage points',
+    Miss: 'A promising outcome falls to equal or worse in Maia value estimates',
+    Blunder: 'Model score loss greater than 20 percentage points'
+  };
   const ChessClass = typeof Chess !== 'undefined' ? Chess : window.Chess;
   const ortApi = typeof ort !== 'undefined' ? ort : window.ort;
   if (!ChessClass) {
@@ -96,6 +108,8 @@
   let maiaLoading = null;
   let maiaDownloadController = null;
   let maiaRun = null;
+  let maiaValueTask = null;
+  const maiaValueCache = new Map();
   let maiaError = '';
   let maiaBackend = '';
   let maiaRating = Math.max(600, Math.min(2600, Number(readSetting('maia-rating') ?? 2600) || 2600));
@@ -574,8 +588,18 @@
   }
   function displayArrowMoves(moves = shownMoves) {
     const categories = categoryArrowsForBoard();
+    const maiaGrades = engineMode === 'maia'
+      ? new Map((maiaValueCache.get(maiaValueKey(game?.fen() || ''))?.moves || [])
+        .map(move => [move.uci, move])) : null;
+    const suggestions = moves.map(move => {
+      const grade = maiaGrades?.get(move.uci);
+      if (!grade) return move;
+      const visual = REVIEW_PALETTE[grade.category];
+      return {...move, color: visual.color, icon: visual.icon, category: grade.category,
+        label: `${(100 * grade.expected).toFixed(1)}%`, metric: 'Maia expected score'};
+    });
     const display = [];
-    for (const move of [...categories, ...moves]) {
+    for (const move of [...categories, ...suggestions]) {
       if (display.length >= MAX_BOARD_ARROWS) break;
       if (!display.some(existing => existing.uci === move.uci)) display.push(move);
     }
@@ -601,7 +625,8 @@
       const row = document.createElement('div');
       row.className = 'category-row';
       row.dataset.available = match ? 'true' : 'false';
-      row.title = REVIEW_RULES[category];
+      row.title = engineMode === 'maia' && maiaValueCache.has(maiaValueKey(game?.fen() || ''))
+        ? MAIA_REVIEW_RULES[category] : REVIEW_RULES[category];
       const badge = makeReviewBadge(document, {category, ...visual});
       badge.setAttribute('width', '20');
       badge.setAttribute('height', '20');
@@ -634,9 +659,11 @@
     renderCategoryList();
     arrowNoteEl.hidden = !multiArrowPage();
     arrowNoteEl.textContent = displayMoves.some(move => move.category)
-      ? 'Category colors use every legal move; live labels may change as search deepens.'
+      ? engineMode === 'maia' && maiaValueCache.has(maiaValueKey(game?.fen() || ''))
+        ? 'Maia colors compare value estimates for displayed moves, not official Game Review.'
+        : 'Category colors use every legal move; live labels may change as search deepens.'
       : engineMode === 'maia'
-        ? 'Maia shows move probabilities; quality colors need a prior full-move review of this position.'
+        ? 'Blue ranks appear first; Maia then evaluates the displayed moves for color.'
         : 'Move-quality arrows appear after the full legal-move search reaches this position.';
     const recent = botGamePage() ? liveReview[liveReview.length - 1] : null;
     let drawn = false;
@@ -1053,6 +1080,33 @@
       return new ortApi.Tensor('int32', Int32Array.of(maiaRating), [1]);
     throw new Error(`${name} has unsupported type ${type}`);
   }
+  function maiaValueKey(fen) {
+    return `${maiaRating}|${fen}`;
+  }
+  function maiaExpectedAfterMove(logits) {
+    if (!logits || logits.length !== 3 || !Array.from(logits).every(Number.isFinite)) return null;
+    const largest = Math.max(...logits);
+    const weights = Array.from(logits, value => Math.exp(value - largest));
+    const total = weights.reduce((sum, value) => sum + value, 0);
+    // The successor is the opponent's turn: their loss is the original mover's win.
+    return (weights[0] + weights[1] / 2) / total;
+  }
+  function renderMaiaMoves() {
+    const grades = new Map((maiaValueCache.get(maiaValueKey(game?.fen() || ''))?.moves || [])
+      .map(move => [move.uci, move]));
+    movesEl.replaceChildren();
+    for (const move of shownMoves) {
+      const item = document.createElement('li');
+      const grade = grades.get(move.uci);
+      item.textContent = grade
+        ? `${move.uci} · ${grade.category} · Maia score ${(100 * grade.expected).toFixed(1)}% · Move probability ${move.label}`
+        : `${move.uci} · Move probability ${move.label}`;
+      item.style.color = '#e5efff';
+      item.style.borderLeft = `3px solid ${grade ? REVIEW_PALETTE[grade.category].color : move.color}`;
+      item.style.paddingLeft = '6px';
+      movesEl.appendChild(item);
+    }
+  }
   function showMaiaValue(logits, blackToMove) {
     if (!logits || logits.length !== 3 || !Array.from(logits).every(Number.isFinite)) {
       shownValue = null;
@@ -1196,20 +1250,16 @@
         metric: 'Move probability', rank: rank + 1,
         color: TOP_MOVE_COLORS[rank] || '#9ebcda', opacity: Math.max(0.42, 1 - rank * 0.07)
       }));
-      movesEl.replaceChildren();
-      for (const move of shownMoves) {
-        const item = document.createElement('li');
-        item.textContent = `${move.uci} · Move probability ${move.label}`;
-        item.style.color = '#e5efff';
-        item.style.borderLeft = `3px solid ${move.color}`;
-        item.style.paddingLeft = '6px';
-        movesEl.appendChild(item);
-      }
+      renderMaiaMoves();
       showMaiaValue(output.logits_value?.data, black);
       drawArrows();
       setStatus(`Maia 79M · ${maiaBackend} · rating ${maiaRating} · ${black ? 'Black' : 'White'} to move`);
       publishStreamState();
       maybeAutoPlay(fen, best.uci);
+      if (!maiaValueCache.has(maiaValueKey(fen))) setTimeout(() => {
+        if (id === inferenceId && engineMode === 'maia' && game?.fen() === fen)
+          void classifyMaiaCandidates(fen, id, shownMoves.map(move => move.uci));
+      }, 0);
     } catch (error) {
       if (id === inferenceId && engineMode === 'maia') {
         clearPrediction();
@@ -1218,6 +1268,76 @@
       }
     } finally {
       if (maiaRun === run) maiaRun = null;
+      if (engineMode === 'maia') scan();
+    }
+  }
+
+  function qualityFromMaiaValue(best, expected, isBest, second = null) {
+    const loss = Math.max(0, best - expected);
+    if (isBest && Number.isFinite(second) && best >= 0.6 && second <= 0.45 &&
+        best - second >= 0.15) return 'Great';
+    if (isBest || loss <= 0.005) return 'Best';
+    if (loss <= 0.02) return 'Excellent';
+    if (loss <= 0.05) return 'Good';
+    if (best >= 0.7 && expected <= 0.5 && loss >= 0.15) return 'Miss';
+    if (loss <= 0.1) return 'Inaccuracy';
+    if (loss <= 0.2) return 'Mistake';
+    return 'Blunder';
+  }
+  async function classifyMaiaCandidates(fen, id, ucis) {
+    if (maiaValueTask) {
+      try { await maiaValueTask; } catch { /* A previous position may have failed. */ }
+    }
+    if (id !== inferenceId || engineMode !== 'maia' || game?.fen() !== fen ||
+        !maiaSession || maiaValueCache.has(maiaValueKey(fen))) return;
+    const task = (async () => {
+      const scored = [];
+      for (let index = 0; index < ucis.length; index++) {
+        if (id !== inferenceId || engineMode !== 'maia' || game?.fen() !== fen || !maiaSession) return;
+        const uci = ucis[index];
+        const next = new ChessClass(fen);
+        const applied = next.move({from: uci.slice(0, 2), to: uci.slice(2, 4),
+          promotion: uci[4] || 'q'});
+        if (!applied) {
+          setStatus('Maia move-value analysis unavailable for this position.');
+          return;
+        }
+        setStatus(`Maia 79M · evaluating move values ${index + 1}/${ucis.length}…`);
+        const feeds = {tokens: new ortApi.Tensor('float32', boardTokens(next.fen()), [1, 64, 96]),
+          self_elo: maiaRatingTensor('self_elo'), oppo_elo: maiaRatingTensor('oppo_elo')};
+        const run = maiaSession.run(feeds);
+        maiaRun = run;
+        let output;
+        try { output = await run; }
+        finally { if (maiaRun === run) maiaRun = null; }
+        if (id !== inferenceId || engineMode !== 'maia' || game?.fen() !== fen) return;
+        const expected = maiaExpectedAfterMove(output.logits_value?.data);
+        if (expected === null) {
+          setStatus('Maia value output unavailable; showing ranked suggestions.');
+          return;
+        }
+        scored.push({uci, expected});
+      }
+      if (scored.length !== ucis.length || !scored.length) return;
+      scored.sort((a, b) => b.expected - a.expected);
+      const best = scored[0].expected, second = scored[1]?.expected;
+      scored.forEach((move, index) => {
+        move.category = qualityFromMaiaValue(best, move.expected, index === 0, second);
+      });
+      maiaValueCache.set(maiaValueKey(fen), {moves: scored});
+      if (maiaValueCache.size > 32) maiaValueCache.delete(maiaValueCache.keys().next().value);
+      renderMaiaMoves();
+      drawArrows();
+      setStatus(`Maia 79M · ${maiaBackend} · value estimates ready · ${game.turn() === 'b' ? 'Black' : 'White'} to move`);
+      publishStreamState();
+    })();
+    maiaValueTask = task;
+    try { await task; }
+    catch (error) {
+      if (id === inferenceId && engineMode === 'maia')
+        setStatus(`Maia move-value analysis unavailable: ${error.message}`);
+    } finally {
+      if (maiaValueTask === task) maiaValueTask = null;
       if (engineMode === 'maia') scan();
     }
   }
@@ -1312,6 +1432,18 @@
   }
   function categoryArrowsForBoard() {
     if (!multiArrowPage() || !game) return [];
+    const maia = engineMode === 'maia' ? maiaValueCache.get(maiaValueKey(game.fen())) : null;
+    if (maia?.moves?.length) {
+      const representatives = new Map();
+      for (const move of maia.moves) {
+        if (representatives.has(move.category)) continue;
+        const visual = REVIEW_PALETTE[move.category];
+        representatives.set(move.category, {uci: move.uci,
+          label: `${(100 * move.expected).toFixed(1)}%`, metric: 'Maia expected score',
+          color: visual.color, icon: visual.icon, category: move.category});
+      }
+      return CATEGORY_ORDER.filter(name => representatives.has(name)).map(name => representatives.get(name));
+    }
     const position = reviewEntries().find(item => item.fen === game.fen() && item.complete &&
       item.moves?.length === item.legalCount &&
       item.moves.every(move => Number.isFinite(move.cp))) || liveCategoryByFen.get(game.fen());
@@ -1910,13 +2042,20 @@
     if (!streamerMode || !streamChannel) return;
     const entries = reviewEntries();
     const totals = reviewSummary(entries);
+    const top = shownMoves[0];
+    const maiaGrade = engineMode === 'maia' && top
+      ? maiaValueCache.get(maiaValueKey(game?.fen() || ''))?.moves.find(move => move.uci === top.uci)
+      : null;
+    const topVisual = maiaGrade ? REVIEW_PALETTE[maiaGrade.category] : null;
     const state = {type: 'state', status: statusEl.textContent, opening: openingName,
       fen: game?.fen() || '', blackView: board ? isBlackView() : lastBoardOrientation,
       skin: captureBoardSkin(),
       engineMode, depth, maiaRating, autoPlay, autoNextBot, study: studyReviewPage(),
-      moves: shownMoves.slice(0, 1).map(move =>
-        ({uci: move.uci, label: move.label, metric: move.metric, color: move.color,
-          icon: move.icon, opacity: move.opacity, rank: move.rank, category: move.category})),
+      moves: top ? [{uci: top.uci,
+        label: maiaGrade ? `${(100 * maiaGrade.expected).toFixed(1)}%` : top.label,
+        metric: maiaGrade ? 'Maia expected score' : top.metric,
+        color: topVisual?.color || top.color, icon: topVisual?.icon || top.icon,
+        opacity: top.opacity, rank: top.rank, category: maiaGrade?.category || top.category}] : [],
       recent: null,
       review: studyReviewPage() && entries.some(item => item.review) ? {
         white: totals.w.count ? totals.w.sum / totals.w.count : null,
