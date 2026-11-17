@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stockfish 19 / Maia 3 Chess Board Assistant
 // @namespace    https://github.com/Jbsroboticsandautomationengineerstudent/Chess-study-training
-// @version      1.5.2
+// @version      1.5.3
 // @description  Switchable Stockfish 19 and Maia 3 board analysis
 // @match        https://www.chess.com/*
 // @match        https://chess.com/*
@@ -110,7 +110,7 @@
   let researchJob = null;
   let researchResult = null;
   let reviewSignature = '';
-  let lastStudyRoute = null;
+  let lastRouteMode = null;
   let liveReview = [];
   const liveCategoryByFen = new Map();
   let livePending = null;
@@ -541,7 +541,7 @@
   function displayArrowMoves(moves = shownMoves) {
     const categories = categoryArrowsForBoard();
     if (categories.length) return categories;
-    const display = moves.slice(0, studyReviewPage() ? 3 : 1);
+    const display = moves.slice(0, multiArrowPage() ? 3 : 1);
     const reviewed = reviewMoveForBoard();
     if (reviewed) {
       const same = display.findIndex(move => move.uci === reviewed.uci);
@@ -565,10 +565,12 @@
       line.style.color = move.color;
       categoryListEl.appendChild(line);
     }
-    arrowNoteEl.hidden = !studyReviewPage();
+    arrowNoteEl.hidden = !multiArrowPage();
     arrowNoteEl.textContent = displayMoves.some(move => move.category)
       ? 'Category colors use every legal move; live labels may change as search deepens.'
-      : 'Move-quality arrows appear after the full legal-move search reaches this position.';
+      : engineMode === 'maia'
+        ? 'Maia shows move probabilities; quality colors need a prior full-move review of this position.'
+        : 'Move-quality arrows appear after the full legal-move search reaches this position.';
     const recent = botGamePage() ? liveReview[liveReview.length - 1] : null;
     let drawn = false;
     if (board) for (const move of [...displayMoves].reverse())
@@ -861,8 +863,9 @@
 
   function scan() {
     const study = studyReviewPage();
-    if (study !== lastStudyRoute) {
-      lastStudyRoute = study;
+    const routeMode = `${study}:${multiArrowPage()}`;
+    if (routeMode !== lastRouteMode) {
+      lastRouteMode = routeMode;
       lastFen = '';
       syncEngineUi();
     }
@@ -1120,7 +1123,7 @@
       const largest = candidates[0].logit;
       const total = candidates.reduce((sum, move) => sum + Math.exp(move.logit - largest), 0);
       const best = candidates[0];
-      shownMoves = candidates.slice(0, studyReviewPage() ? 3 : 1).map((candidate, rank) => ({
+      shownMoves = candidates.slice(0, multiArrowPage() ? 3 : 1).map((candidate, rank) => ({
         uci: candidate.uci, label: `${(100 * Math.exp(candidate.logit - largest) / total).toFixed(1)}%`,
         metric: 'Move probability', rank: rank + 1,
         color: TOP_MOVE_COLORS[rank], opacity: [1, 0.78, 0.62][rank]
@@ -1222,6 +1225,9 @@
   function studyReviewPage() {
     return /^\/(?:analysis(?:\/|$)|play\/computer(?:\/|$))/.test(location.pathname);
   }
+  function multiArrowPage() {
+    return /^\/(?:analysis|play|game)(?:\/|$)/.test(location.pathname);
+  }
   function reviewForBoard() {
     const entries = reviewEntries();
     return game ? entries.find(item => item.fen === game.fen() && item.review) : null;
@@ -1235,7 +1241,7 @@
       metric: `${item.review.category} · review accuracy`, color: visual.color, icon: visual.icon};
   }
   function categoryArrowsForBoard() {
-    if (!studyReviewPage() || !game) return [];
+    if (!multiArrowPage() || !game) return [];
     const position = reviewEntries().find(item => item.fen === game.fen() && item.complete &&
       item.moves?.length === item.legalCount &&
       item.moves.every(move => Number.isFinite(move.cp))) || liveCategoryByFen.get(game.fen());
@@ -1470,7 +1476,7 @@
     if (engineMode !== 'stockfish' || !engineReady || activeSearch || !pendingSearch || !worker || researchJob) return;
     activeSearch = {...pendingSearch, stale: false, evaluation: null, reachedDepth: 0,
       lines: new Map(), categoryDepth: 0,
-      multipv: studyReviewPage() ? game.moves().length : 1,
+      multipv: multiArrowPage() ? game.moves().length : 1,
       legal: new Set(game.moves({verbose: true}).map(move => `${move.from}${move.to}${move.promotion || ''}`))};
     pendingSearch = null;
     worker.postMessage(`setoption name MultiPV value ${activeSearch.multipv}`);
@@ -1495,7 +1501,7 @@
     } else beginSearch();
   }
   function refreshLiveCategories(search) {
-    if (!studyReviewPage() || search.multipv < 2 || search.lines.size !== search.multipv) return;
+    if (!multiArrowPage() || search.multipv < 2 || search.lines.size !== search.multipv) return;
     const lines = [...search.lines.values()];
     const commonDepth = Math.min(...lines.map(move => move.depth));
     if (commonDepth < 4 || commonDepth <= search.categoryDepth ||
@@ -1567,7 +1573,7 @@
         `${move.from}${move.to}${move.promotion || ''}` === best);
       if (best && legal) {
         const candidates = [{uci: best, rank: 1, evaluation: finished.evaluation}];
-        if (studyReviewPage()) for (let rank = 2; rank <= Math.min(3, finished.multipv); rank++) {
+        if (multiArrowPage()) for (let rank = 2; rank <= Math.min(3, finished.multipv); rank++) {
           const alternative = finished.lines.get(rank);
           if (alternative?.depth < finished.reachedDepth || !alternative ||
               candidates.some(move => move.uci === alternative.uci)) continue;
@@ -1583,8 +1589,8 @@
           const visual = category ? REVIEW_PALETTE[category] : null;
           return {uci: candidate.uci, label: expected === null ? '' : `${expected.toFixed(1)}%`,
             metric: category ? `${category} · expected score` : 'Expected score', rank: index + 1,
-            color: studyReviewPage() ? visual?.color || TOP_MOVE_COLORS[index] : undefined,
-            icon: studyReviewPage() ? visual?.icon : undefined,
+            color: multiArrowPage() ? visual?.color || TOP_MOVE_COLORS[index] : undefined,
+            icon: multiArrowPage() ? visual?.icon : undefined,
             opacity: [1, 0.78, 0.62][index]};
         });
         movesEl.replaceChildren();
