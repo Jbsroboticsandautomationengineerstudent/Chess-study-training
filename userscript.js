@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stockfish 19 / Maia 3 Chess Board Assistant
 // @namespace    https://github.com/Jbsroboticsandautomationengineerstudent/Chess-study-training
-// @version      1.5.3
+// @version      1.5.4
 // @description  Switchable Stockfish 19 and Maia 3 board analysis
 // @match        https://www.chess.com/*
 // @match        https://chess.com/*
@@ -33,11 +33,13 @@
   const TOP_MOVE_COLORS = ['#00008A', '#3273b7', '#7fa7d1'];
   const REVIEW_PALETTE = {
     Brilliant: {color: '#28c9bd', icon: '!!'}, Great: {color: '#6f9fca', icon: '!'},
-    Best: {color: '#78b847', icon: '★'}, Excellent: {color: '#93bf5c', icon: '+'},
-    Good: {color: '#76ae70', icon: '✓'}, Book: {color: '#b7976e', icon: 'B'},
+    Best: {color: '#78b847', icon: '★'}, Excellent: {color: '#93bf5c', icon: '👍'},
+    Good: {color: '#76ae70', icon: '✓'}, Book: {color: '#b7976e', icon: '📖'},
     Inaccuracy: {color: '#e2c145', icon: '?!'}, Mistake: {color: '#e69b58', icon: '?'},
     Miss: {color: '#dc6968', icon: '×'}, Blunder: {color: '#d6534f', icon: '??'}
   };
+  const CATEGORY_ORDER = ['Great', 'Best', 'Excellent', 'Good', 'Book',
+    'Inaccuracy', 'Mistake', 'Miss', 'Blunder', 'Brilliant'];
   const REVIEW_RULES = {
     Brilliant: 'Unavailable: needs validated sacrifice analysis',
     Great: 'Best move; at least 150 cp ahead of the second choice, which is below -100 cp',
@@ -111,6 +113,7 @@
   let researchResult = null;
   let reviewSignature = '';
   let lastRouteMode = null;
+  let categoryListSignature = '';
   let liveReview = [];
   const liveCategoryByFen = new Map();
   let livePending = null;
@@ -141,12 +144,13 @@
     #maia-web-panel{position:fixed;top:90px;right:16px;z-index:2147483646;
       width:min(320px,calc(100vw - 24px));box-sizing:border-box;background:#15212c;
       color:#f7f9fb;border:1px solid #496276;border-radius:12px;
-      box-shadow:0 14px 36px #0009;font:13px/1.4 system-ui,-apple-system,sans-serif}
+      box-shadow:0 14px 36px #0009;font:13px/1.4 system-ui,-apple-system,sans-serif;
+      display:flex;flex-direction:column;max-height:calc(100vh - 100px);overflow:hidden}
     #maia-web-panel *{box-sizing:border-box}
     #maia-web-head{padding:11px 13px;background:linear-gradient(115deg,#253d4e,#1c2c3c);
       border-bottom:2px solid #37b9aa;border-radius:11px 11px 0 0;letter-spacing:.02em;
       font-weight:700;cursor:grab;touch-action:none;user-select:none;display:flex;justify-content:space-between}
-    #maia-web-panel .body{padding:10px 12px}
+    #maia-web-panel .body{padding:10px 12px;overflow-y:auto;min-height:0}
     #maia-web-panel .review-card{margin:8px 0;padding:9px;border:1px solid #50657b;border-radius:8px;background:#213144}
     #maia-web-panel .review-card strong{font-size:12px;letter-spacing:.02em}
     #maia-web-panel .review-scores{display:flex;justify-content:space-between;gap:8px;margin-top:5px;font-variant-numeric:tabular-nums}
@@ -185,7 +189,11 @@
     #maia-web-research .row input{flex:1;width:0;min-width:0}
     #maia-web-research .row select{max-width:95px}
     #maia-web-research-note{font-size:11px;color:#c6d5e4;white-space:pre-wrap}
-    #maia-web-category-list{display:grid;gap:2px;font:12px/1.4 ui-monospace,monospace}
+    #maia-web-category-list{display:grid;gap:3px;font:12px/1.4 ui-monospace,monospace}
+    #maia-web-category-list .category-row{display:flex;align-items:center;gap:7px;min-height:22px}
+    #maia-web-category-list .category-name{min-width:77px;font-weight:700}
+    #maia-web-category-list .category-result{color:#c6d5e4;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    #maia-web-category-list .category-row[data-available="false"]{opacity:.7}
     #maia-web-arrow-note{font-size:11px;color:#aebfd0;margin:3px 0 8px}
     @media(max-width:600px){#maia-web-panel{top:68px;right:8px}}
   `;
@@ -291,6 +299,7 @@
     lastFen = '';
     movesEl.replaceChildren();
     categoryListEl.replaceChildren();
+    categoryListSignature = '';
     arrowNoteEl.hidden = true;
     shownMoves = [];
     shownValue = null;
@@ -323,6 +332,35 @@
     return {x: (black ? 7 - file : file) * 12.5 + 6.25,
             y: (black ? rank : 7 - rank) * 12.5 + 6.25};
   }
+  function makeReviewBadge(doc, move) {
+    const badge = doc.createElementNS(svgNS, 'svg');
+    badge.setAttribute('viewBox', '0 0 32 32');
+    badge.setAttribute('aria-label', move.category || 'Move quality');
+    const circle = doc.createElementNS(svgNS, 'circle');
+    for (const [name, value] of Object.entries({cx: 16, cy: 16, r: 15,
+      fill: move.color || REVIEW_PALETTE[move.category]?.color || '#789'}))
+      circle.setAttribute(name, value);
+    badge.appendChild(circle);
+    if (move.category === 'Book' || move.category === 'Excellent') {
+      const path = doc.createElementNS(svgNS, 'path');
+      path.setAttribute('d', move.category === 'Book'
+        ? 'M5 9c4-1.5 7-.7 11 1.5C20 8.3 23 7.5 27 9v15c-4-1.5-7-.8-11 1.5C12 23.2 9 22.5 5 24z M16 10.5v15'
+        : 'M10 14h3l3-6c.5-1.4 2.5-1 2.5.6V14h5c1.6 0 2.5 1.2 2.1 2.7l-2.3 8c-.2.8-1 1.3-1.9 1.3H10z M5 14h4v12H5z');
+      path.setAttribute('fill', move.category === 'Book' ? 'none' : '#fff');
+      path.setAttribute('stroke', '#fff');
+      path.setAttribute('stroke-width', move.category === 'Book' ? '2' : '1');
+      path.setAttribute('stroke-linejoin', 'round');
+      badge.appendChild(path);
+    } else {
+      const text = doc.createElementNS(svgNS, 'text');
+      for (const [name, value] of Object.entries({x: 16, y: 22, 'text-anchor': 'middle',
+        'font-size': (move.icon || '').length > 1 ? 16 : 21, 'font-weight': 800,
+        'font-family': 'system-ui,sans-serif', fill: '#fff'})) text.setAttribute(name, value);
+      text.textContent = move.icon || REVIEW_PALETTE[move.category]?.icon || '';
+      badge.appendChild(text);
+    }
+    return badge;
+  }
   function paintMoveArrow(svg, doc, move, blackView) {
     const a = squarePoint(move.uci.slice(0, 2), blackView);
     const b = squarePoint(move.uci.slice(2, 4), blackView);
@@ -345,18 +383,10 @@
     tip.setAttribute('fill-opacity', opacity);
     svg.appendChild(tip);
     if (move.icon) {
-      const badge = doc.createElementNS(svgNS, 'circle');
-      for (const [name, value] of Object.entries({cx: b.x, cy: b.y - 3.3, r: 2.5, fill: color}))
-        badge.setAttribute(name, value);
-      badge.setAttribute('fill-opacity', opacity);
+      const badge = makeReviewBadge(doc, move);
+      for (const [name, value] of Object.entries({x: b.x - 2.6, y: b.y - 6.1,
+        width: 5.2, height: 5.2, opacity})) badge.setAttribute(name, value);
       svg.appendChild(badge);
-      const icon = doc.createElementNS(svgNS, 'text');
-      for (const [name, value] of Object.entries({x: b.x, y: b.y - 2.25, 'text-anchor': 'middle',
-        'font-size': move.icon.length > 1 ? 2.5 : 3.2, 'font-weight': 800, fill: '#fff'}))
-        icon.setAttribute(name, value);
-      icon.textContent = move.icon;
-      icon.setAttribute('opacity', opacity);
-      svg.appendChild(icon);
     }
     const label = doc.createElementNS(svgNS, 'text');
     label.setAttribute('x', b.x);
@@ -550,6 +580,41 @@
     }
     return display;
   }
+  function renderCategoryList(categories = categoryArrowsForBoard()) {
+    const signature = JSON.stringify([game?.fen(), engineMode, engineReady,
+      categories.map(move => [move.category, move.uci, move.label])]);
+    if (signature === categoryListSignature) return;
+    categoryListSignature = signature;
+    categoryListEl.replaceChildren();
+    const matches = new Map(categories.map(move => [move.category, move]));
+    for (const category of CATEGORY_ORDER) {
+      const visual = REVIEW_PALETTE[category];
+      const match = matches.get(category);
+      const row = document.createElement('div');
+      row.className = 'category-row';
+      row.dataset.available = match ? 'true' : 'false';
+      row.title = REVIEW_RULES[category];
+      const badge = makeReviewBadge(document, {category, ...visual});
+      badge.setAttribute('width', '20');
+      badge.setAttribute('height', '20');
+      badge.setAttribute('aria-hidden', 'true');
+      const name = document.createElement('span');
+      name.className = 'category-name';
+      name.style.color = visual.color;
+      name.textContent = category;
+      const result = document.createElement('span');
+      result.className = 'category-result';
+      result.textContent = match ? `${match.uci} · ${match.label}` :
+        !game ? 'Waiting for board' :
+        category === 'Brilliant' ? 'Sacrifice analysis unavailable' :
+        category === 'Book' ? 'Opening book unavailable' :
+        categories.length ? 'No qualifying move' :
+        engineMode === 'maia' ? 'Needs full-move evaluation' :
+        engineReady ? 'Evaluating legal moves…' : 'Waiting for engine';
+      row.append(badge, name, result);
+      categoryListEl.appendChild(row);
+    }
+  }
   function drawArrows(moves = shownMoves) {
     if (streamerMode) {
       arrow.replaceChildren();
@@ -558,13 +623,7 @@
     }
     arrow.replaceChildren();
     const displayMoves = displayArrowMoves(moves);
-    categoryListEl.replaceChildren();
-    for (const move of displayMoves.filter(candidate => candidate.category)) {
-      const line = document.createElement('div');
-      line.textContent = `${move.icon} ${move.category} · ${move.uci} · ${move.label}`;
-      line.style.color = move.color;
-      categoryListEl.appendChild(line);
-    }
+    renderCategoryList();
     arrowNoteEl.hidden = !multiArrowPage();
     arrowNoteEl.textContent = displayMoves.some(move => move.category)
       ? 'Category colors use every legal move; live labels may change as search deepens.'
@@ -932,6 +991,7 @@
     if (!game) return;
     const fen = game.fen();
     if (fenEl.textContent !== fen) fenEl.textContent = fen;
+    renderCategoryList();
     if (engineMode === 'maia') {
       if (maiaSession) void predictMaia(fen);
       else if (maiaError) setStatus(maiaError);
@@ -1226,7 +1286,8 @@
     return /^\/(?:analysis(?:\/|$)|play\/computer(?:\/|$))/.test(location.pathname);
   }
   function multiArrowPage() {
-    return /^\/(?:analysis|play|game)(?:\/|$)/.test(location.pathname);
+    // A validated board position is the scope; Chess.com can mount it on any route.
+    return Boolean(board?.isConnected && game);
   }
   function reviewForBoard() {
     const entries = reviewEntries();
@@ -1238,7 +1299,8 @@
     if (!item) return null;
     const visual = REVIEW_PALETTE[item.review.category];
     return {uci: item.played, label: `${item.review.accuracy.toFixed(0)}%`,
-      metric: `${item.review.category} · review accuracy`, color: visual.color, icon: visual.icon};
+      metric: `${item.review.category} · review accuracy`, color: visual.color,
+      icon: visual.icon, category: item.review.category};
   }
   function categoryArrowsForBoard() {
     if (!multiArrowPage() || !game) return [];
@@ -1258,7 +1320,7 @@
         label: `${quality.accuracy.toFixed(0)}%`, metric: `${quality.category} · review accuracy`,
         color: visual.color, icon: visual.icon, category: quality.category});
     }
-    return [...representatives.values()];
+    return CATEGORY_ORDER.filter(name => representatives.has(name)).map(name => representatives.get(name));
   }
   function reviewSummary(entries) {
     const summary = {w: {count: 0, sum: 0, lossCp: 0}, b: {count: 0, sum: 0, lossCp: 0}};
@@ -1591,6 +1653,7 @@
             metric: category ? `${category} · expected score` : 'Expected score', rank: index + 1,
             color: multiArrowPage() ? visual?.color || TOP_MOVE_COLORS[index] : undefined,
             icon: multiArrowPage() ? visual?.icon : undefined,
+            category,
             opacity: [1, 0.78, 0.62][index]};
         });
         movesEl.replaceChildren();
