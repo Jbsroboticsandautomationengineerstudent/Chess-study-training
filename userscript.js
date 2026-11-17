@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stockfish 19 Chess Board Assistant
 // @namespace    https://github.com/Jbsroboticsandautomationengineerstudent/Chess-study-training
-// @version      1.3.1
+// @version      1.3.2
 // @description  Switchable Stockfish 19 and Maia 3 board analysis
 // @match        https://www.chess.com/*
 // @match        https://chess.com/*
@@ -232,12 +232,12 @@
     const ux = dx / length, uy = dy / length;
     const endX = b.x - ux * 3.2, endY = b.y - uy * 3.2;
     const line = doc.createElementNS(svgNS, 'line');
-    for (const [name, value] of Object.entries({x1: a.x, y1: a.y, x2: endX, y2: endY, stroke: '#24dc83', 'stroke-width': 1.8, 'stroke-linecap': 'round'})) line.setAttribute(name, value);
+    for (const [name, value] of Object.entries({x1: a.x, y1: a.y, x2: endX, y2: endY, stroke: '#00008A', 'stroke-width': 1.8, 'stroke-linecap': 'round'})) line.setAttribute(name, value);
     svg.appendChild(line);
     const tip = doc.createElementNS(svgNS, 'polygon');
     const wingX = -uy * 2.1, wingY = ux * 2.1;
     tip.setAttribute('points', `${b.x},${b.y} ${b.x - ux * 4.3 + wingX},${b.y - uy * 4.3 + wingY} ${b.x - ux * 4.3 - wingX},${b.y - uy * 4.3 - wingY}`);
-    tip.setAttribute('fill', '#24dc83');
+    tip.setAttribute('fill', '#00008A');
     svg.appendChild(tip);
     const label = doc.createElementNS(svgNS, 'text');
     label.setAttribute('x', b.x);
