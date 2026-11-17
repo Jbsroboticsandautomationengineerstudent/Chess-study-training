@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stockfish 19 / Maia 3 Chess Board Assistant
 // @namespace    https://github.com/Jbsroboticsandautomationengineerstudent/Chess-study-training
-// @version      1.5.8
+// @version      1.5.9
 // @description  Switchable Stockfish 19 and Maia 3 board analysis
 // @match        https://www.chess.com/*
 // @match        https://chess.com/*
@@ -31,7 +31,8 @@
   const ORT_DIST = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/';
   const RESEARCH_DEPTH = 18;
   const MAX_BOARD_ARROWS = 10;
-  const TOP_MOVE_COLORS = ['#00008A', '#3273b7', '#7fa7d1'];
+  const STRONGEST_COLOR = '#00008A';
+  const TOP_MOVE_COLORS = [STRONGEST_COLOR, '#3273b7', '#7fa7d1'];
   const REVIEW_PALETTE = {
     Brilliant: {color: '#28c0a0', icon: '!!'}, Great: {color: '#7098c0', icon: '!'},
     Best: {color: '#80b050', icon: '★'}, Excellent: {color: '#84b450', icon: '👍'},
@@ -224,8 +225,8 @@
       <div class="row" id="maia-web-stockfish-strength" title="Full single-threaded build; no strength handicap. Elo is not fixed by depth.">Full build · Max skill · Elo varies</div>
       <div class="row" id="maia-web-maia-settings" hidden><label for="maia-web-rating">Maia rating</label><input id="maia-web-rating" type="range" min="600" max="2600" step="100" value="2600"><span id="maia-web-rating-label">2600</span></div>
       <div class="row" id="maia-web-maia-note" hidden>Maia 79M · one prediction pass; no search depth</div>
-      <div class="row" id="maia-web-auto-row" hidden><button id="maia-web-autoplay">Auto-play Maia: OFF</button>
-        <select id="maia-web-auto-side" aria-label="Side for Maia auto-play"><option value="bottom">Bottom side</option><option value="w">White</option><option value="b">Black</option></select></div>
+      <div class="row" id="maia-web-auto-row"><button id="maia-web-autoplay">Auto-play: OFF</button>
+        <select id="maia-web-auto-side" aria-label="Your side for arrows and auto-play"><option value="bottom">Bottom side</option><option value="w">White</option><option value="b">Black</option></select></div>
       <div class="row" id="maia-web-next-row" hidden><button id="maia-web-next">Auto next bot game: OFF</button></div>
       <div class="row"><button id="maia-web-flip" title="Reverse arrow orientation">Flip</button></div>
       <div id="maia-web-status">Finding board…</div>
@@ -586,6 +587,13 @@
     if (ranks.length === 8 && recentMove && !moves?.some(move => move.uci === recentMove.uci))
       paintMoveArrow(miniArrow, doc, recentMove, blackView);
   }
+  function engineScoreLabel(evaluation) {
+    if (Number.isFinite(evaluation?.cp))
+      return `${evaluation.cp >= 0 ? '+' : ''}${evaluation.cp} cp`;
+    if (Number.isFinite(evaluation?.mate))
+      return `M${evaluation.mate >= 0 ? '+' : ''}${evaluation.mate}`;
+    return '';
+  }
   function displayArrowMoves(moves = shownMoves) {
     const categories = categoryArrowsForBoard();
     const maiaGrades = engineMode === 'maia'
@@ -596,7 +604,7 @@
       if (!grade) return move;
       const visual = REVIEW_PALETTE[grade.category];
       return {...move, color: visual.color, icon: visual.icon, category: grade.category, opacity: 1,
-        label: `${(100 * grade.expected).toFixed(1)}%`, metric: 'Maia expected score'};
+        label: `M ${(100 * grade.expected).toFixed(1)}%`, metric: 'Maia expected score'};
     });
     const display = [];
     for (const move of [...categories, ...suggestions]) {
@@ -662,42 +670,50 @@
       return;
     }
     arrow.replaceChildren();
+    if (!game || game.turn() !== autoSide()) {
+      arrow.style.display = 'none';
+      movesEl.hidden = true;
+      categoryListEl.hidden = true;
+      arrowNoteEl.hidden = !multiArrowPage();
+      arrowNoteEl.textContent = 'Waiting for your turn.';
+      return;
+    }
+    movesEl.hidden = false;
+    categoryListEl.hidden = false;
     const displayMoves = displayArrowMoves(moves);
     const maiaResult = engineMode === 'maia'
       ? maiaValueCache.get(maiaValueKey(game?.fen() || '')) : null;
-    const paintMoves = engineMode === 'maia'
-      ? displayMoves.filter(move => move.category && REVIEW_PALETTE[move.category]) : displayMoves;
+    const strongest = moves[0]?.uci ? {...moves[0], color: STRONGEST_COLOR,
+      icon: null, category: null, rank: 1, opacity: 1,
+      label: engineMode === 'maia' ? `p ${moves[0].label}` : moves[0].label} : null;
+    const paintMoves = displayMoves.filter(move => move.category && REVIEW_PALETTE[move.category] &&
+      move.uci !== strongest?.uci);
     renderCategoryList();
     arrowNoteEl.hidden = !multiArrowPage();
     arrowNoteEl.textContent = paintMoves.some(move => move.category)
       ? engineMode === 'maia' && maiaResult
         ? maiaResult.complete
-          ? 'Maia colors compare all legal move values, not official Game Review.'
-          : 'Maia colors are provisional; checking remaining legal moves.'
-        : 'Category colors use every legal move; live labels may change as search deepens.'
+          ? 'Blue: strongest Maia policy move (p = move probability). M = Maia expected outcome.'
+          : 'Blue: strongest Maia policy move (p = probability). M colors are provisional.'
+        : 'Blue: strongest search move. cp = side-to-move score at the displayed search depth.'
       : engineMode === 'maia'
-        ? 'Maia is evaluating move values; colored arrows will appear when ready.'
-        : 'Move-quality arrows appear after the full legal-move search reaches this position.';
-    if (engineMode === 'maia' && !paintMoves.length) {
+        ? 'Blue: strongest Maia policy move (p = probability); checking value categories.'
+        : 'Blue: strongest search move. cp = side-to-move score; checking other moves.';
+    if (!paintMoves.length && !strongest) {
       arrow.style.display = 'none';
       return;
     }
-    const recent = engineMode !== 'maia' && botGamePage() ? liveReview[liveReview.length - 1] : null;
     let drawn = false;
     if (board) for (const move of [...paintMoves].reverse())
       drawn = paintMoveArrow(arrow, document, move, isBlackView()) || drawn;
-    if (board && recent?.review && recent.postFen === game?.fen() &&
-        !paintMoves.some(move => move.uci === recent.played)) {
-      const visual = REVIEW_PALETTE[recent.review.category];
-      drawn = paintMoveArrow(arrow, document, {uci: recent.played, color: visual.color,
-        icon: visual.icon, label: `${recent.review.accuracy.toFixed(0)}%`}, isBlackView()) || drawn;
-    }
+    if (board && strongest)
+      drawn = paintMoveArrow(arrow, document, strongest, isBlackView()) || drawn;
     if (!drawn) { arrow.style.display = 'none'; return; }
     arrow.style.display = 'block';
     keepArrowAligned();
   }
   function autoPlayablePage() {
-    return /^\/(?:play|game)\//.test(location.pathname);
+    return /^\/(?:play|game|analysis)(?:\/|$)/.test(location.pathname);
   }
   function botGamePage() {
     return /^\/play\/computer(?:\/|$)/.test(location.pathname);
@@ -707,7 +723,7 @@
     // A bounded illustrative clock density: t0 + lognormal noise. Its parameters
     // are not fitted to human games, so this is a bot-game pace control only.
     const choices = Math.min(40, game?.moves().length || 20);
-    const displayedProbability = parseFloat(shownMoves[0]?.label);
+    const displayedProbability = engineMode === 'maia' ? parseFloat(shownMoves[0]?.label) : NaN;
     const probability = Number.isFinite(displayedProbability)
       ? Math.max(0, Math.min(1, displayedProbability / 100)) : 0.5;
     const median = 1800 + choices * 35 + (1 - probability) * 1000;
@@ -716,11 +732,11 @@
     return Math.round(Math.max(1800, Math.min(7500, 700 + median * Math.exp(0.3 * z))));
   }
   function autoSide() {
-    return autoSideEl.value === 'bottom' ? (isBlackView() ? 'b' : 'w') : autoSideEl.value;
+    return autoSideEl.value === 'bottom' ? (boardViewBlack() ? 'b' : 'w') : autoSideEl.value;
   }
   function boardTarget(square) {
     if (!board?.isConnected) return false;
-    const point = squarePoint(square, isBlackView());
+    const point = squarePoint(square, boardViewBlack());
     const rect = board.getBoundingClientRect();
     const x = rect.left + rect.width * point.x / 100;
     const y = rect.top + rect.height * point.y / 100;
@@ -763,24 +779,24 @@
     }
   }
   function maybeAutoPlay(fen, uci) {
-    if (engineMode !== 'maia' || !autoPlay || !autoPlayablePage() || researchJob ||
+    if (!autoPlay || !autoPlayablePage() || researchJob || game?.game_over?.() ||
         activeSearch || pendingSearch || !board ||
         game?.turn() !== autoSide() || autoPlayedFen === fen) return;
     autoPlayedFen = fen; // One attempt per position, even if the site ignores synthetic events.
     const delay = botThinkingDelay();
     const token = ++autoPlayToken;
-    if (delay) setStatus(`Maia move ready · bot pace ${(delay / 1000).toFixed(1)}s`);
+    if (delay) setStatus(`Move ready · bot pace ${(delay / 1000).toFixed(1)}s`);
     clearTimeout(autoPlayTimer);
     autoPlayTimer = setTimeout(() => {
       autoPlayTimer = 0;
-      if (token !== autoPlayToken || engineMode !== 'maia' || !autoPlay || !autoPlayablePage() ||
-          researchJob || game?.fen() !== fen ||
+      if (token !== autoPlayToken || !autoPlay || !autoPlayablePage() ||
+          researchJob || game?.game_over?.() || game?.fen() !== fen ||
           shownMoves[0]?.uci !== uci || !board?.isConnected) return;
       const moved = clickBoardSquare(uci.slice(0, 2)) && clickBoardSquare(uci.slice(2, 4));
       if (!moved) { setStatus('Auto-play could not reach the board. Move manually.'); return; }
       if (uci.length === 5) setTimeout(() => choosePromotion(uci), 50);
       setTimeout(() => {
-        if (engineMode === 'maia' && autoPlay && autoPlayablePage() && game?.fen() === fen &&
+        if (autoPlay && autoPlayablePage() && game?.fen() === fen &&
             piecesFrom(board) === fen.split(' ')[0]) {
           dragBoardMove(uci);
           if (uci.length === 5) setTimeout(() => choosePromotion(uci), 50);
@@ -788,7 +804,7 @@
       }, 450);
       setTimeout(() => {
         scan();
-        if (engineMode === 'maia' && autoPlay && game?.fen() === fen)
+        if (autoPlay && game?.fen() === fen)
           setStatus('Chess.com did not accept the automatic move. Move manually.');
       }, 1200);
     }, delay);
@@ -809,7 +825,7 @@
     return null;
   }
   function maybeStartNextBotGame() {
-    if (engineMode !== 'maia' || !autoPlay || !autoNextBot || !botGamePage()) {
+    if (!autoPlay || !autoNextBot || !botGamePage()) {
       clearTimeout(nextBotTimer);
       nextBotTimer = 0;
       return;
@@ -826,7 +842,7 @@
     if (!button) return;
     nextBotTimer = setTimeout(() => {
       nextBotTimer = 0;
-      if (engineMode !== 'maia' || !autoPlay || !autoNextBot || !botGamePage() || !button.isConnected ||
+      if (!autoPlay || !autoNextBot || !botGamePage() || !button.isConnected ||
           !(game?.game_over?.() || visibleBotResult()) || nextBotGameButton() !== button) return;
       nextBotAttempted = true;
       setStatus('Starting next bot game…');
@@ -1038,6 +1054,7 @@
       }
       game = next; lastBoard = placement; clearPrediction();
       rememberPosition(game);
+      drawArrows();
     }
     maybeStartNextBotGame();
     if (!game) return;
@@ -1460,8 +1477,9 @@
     const item = reviewForBoard();
     if (!item) return null;
     const visual = REVIEW_PALETTE[item.review.category];
-    return {uci: item.played, label: `${item.review.accuracy.toFixed(0)}%`,
-      metric: `${item.review.category} · review accuracy`, color: visual.color,
+    const evaluated = item.moves?.find(move => move.uci === item.played);
+    return {uci: item.played, label: engineScoreLabel(evaluated),
+      metric: `${item.review.category} · evaluated move`, color: visual.color,
       icon: visual.icon, category: item.review.category};
   }
   function categoryArrowsForBoard() {
@@ -1474,7 +1492,7 @@
         if (representatives.has(move.category)) continue;
         const visual = REVIEW_PALETTE[move.category];
         representatives.set(move.category, {uci: move.uci,
-          label: `${(100 * move.expected).toFixed(1)}%`, metric: 'Maia expected score',
+          label: `M ${(100 * move.expected).toFixed(1)}%`, metric: 'Maia expected score',
           color: visual.color, icon: visual.icon, category: move.category});
       }
       return CATEGORY_ORDER.filter(name => representatives.has(name)).map(name => representatives.get(name));
@@ -1492,7 +1510,7 @@
       if (representatives.has(quality.category)) continue;
       const visual = REVIEW_PALETTE[quality.category];
       representatives.set(quality.category, {uci: candidate.uci,
-        label: `${quality.accuracy.toFixed(0)}%`, metric: `${quality.category} · review accuracy`,
+        label: engineScoreLabel({cp: candidate.cp}), metric: `${quality.category} · centipawn evaluation`,
         color: visual.color, icon: visual.icon, category: quality.category});
     }
     return CATEGORY_ORDER.filter(name => representatives.has(name)).map(name => representatives.get(name));
@@ -1818,14 +1836,13 @@
         }
         const bestCp = finished.evaluation?.cp;
         shownMoves = candidates.map((candidate, index) => {
-          const expected = stockfishExpectedScore(candidate.evaluation);
           const loss = Number.isFinite(bestCp) && Number.isFinite(candidate.evaluation?.cp)
             ? Math.max(0, bestCp - candidate.evaluation.cp) : null;
           const category = index === 0 ? 'Best' : loss === null ? null :
             qualityFromLoss(loss, bestCp, candidate.evaluation.cp, false).category;
           const visual = category ? REVIEW_PALETTE[category] : null;
-          return {uci: candidate.uci, label: expected === null ? '' : `${expected.toFixed(1)}%`,
-            metric: category ? `${category} · expected score` : 'Expected score', rank: index + 1,
+          return {uci: candidate.uci, label: engineScoreLabel(candidate.evaluation),
+            metric: category ? `${category} · engine score` : 'Engine score', rank: index + 1,
             color: multiArrowPage() ? visual?.color || TOP_MOVE_COLORS[index] || '#9ebcda' : undefined,
             icon: multiArrowPage() ? visual?.icon : undefined,
             category,
@@ -1834,7 +1851,7 @@
         movesEl.replaceChildren();
         for (const move of shownMoves) {
           const item = document.createElement('li');
-          item.textContent = `${move.uci} · ${move.metric} ${move.label || 'WDL unavailable'}`;
+          item.textContent = `${move.uci} · ${move.metric} ${move.label || 'score unavailable'}`;
           if (move.color) item.style.color = move.color;
           movesEl.appendChild(item);
         }
@@ -1856,6 +1873,7 @@
           renderReview();
         }
         drawArrows();
+        maybeAutoPlay(finished.fen, best);
         setStatus(`Stockfish 19 · depth ${finished.reachedDepth || finished.depth} · ${game.turn() === 'b' ? 'Black' : 'White'} to move`);
       } else {
         clearPrediction();
@@ -2035,15 +2053,6 @@
     }
   }
 
-  function stockfishExpectedScore(evaluation) {
-    const wdl = evaluation?.wdl;
-    if (Array.isArray(wdl) && wdl.length === 3 && wdl.every(value => Number.isFinite(value) && value >= 0)) {
-      const total = wdl.reduce((sum, value) => sum + value, 0);
-      if (total > 0) return 100 * (wdl[0] + wdl[1] / 2) / total;
-    }
-    if (Number.isFinite(evaluation?.mate)) return evaluation.mate > 0 ? 100 : 0;
-    return null;
-  }
   function showValue(evaluation, blackToMove) {
     if (!evaluation) {
       shownValue = null;
@@ -2077,21 +2086,16 @@
     if (!streamerMode || !streamChannel) return;
     const entries = reviewEntries();
     const totals = reviewSummary(entries);
-    const top = engineMode === 'maia' && !maiaValueCache.has(maiaValueKey(game?.fen() || ''))
-      ? null : shownMoves[0];
-    const maiaGrade = engineMode === 'maia' && top
-      ? maiaValueCache.get(maiaValueKey(game?.fen() || ''))?.moves.find(move => move.uci === top.uci)
-      : null;
-    const topVisual = maiaGrade ? REVIEW_PALETTE[maiaGrade.category] : null;
+    const top = game?.turn() === autoSide() ? shownMoves[0] : null;
     const state = {type: 'state', status: statusEl.textContent, opening: openingName,
       fen: game?.fen() || '', blackView: board ? isBlackView() : lastBoardOrientation,
       skin: captureBoardSkin(),
       engineMode, depth, maiaRating, autoPlay, autoNextBot, study: studyReviewPage(),
       moves: top ? [{uci: top.uci,
-        label: maiaGrade ? `${(100 * maiaGrade.expected).toFixed(1)}%` : top.label,
-        metric: maiaGrade ? 'Maia expected score' : top.metric,
-        color: topVisual?.color || top.color, icon: topVisual?.icon || top.icon,
-        opacity: maiaGrade ? 1 : top.opacity, rank: top.rank, category: maiaGrade?.category || top.category}] : [],
+        label: engineMode === 'maia' ? `p ${top.label}` : top.label,
+        metric: engineMode === 'maia' ? 'Move probability' : top.metric,
+        color: STRONGEST_COLOR, icon: null,
+        opacity: 1, rank: 1, category: null}] : [],
       recent: null,
       review: studyReviewPage() && entries.some(item => item.review) ? {
         white: totals.w.count ? totals.w.sum / totals.w.count : null,
@@ -2151,8 +2155,8 @@
         <ol id="moves"></ol><div id="labels"><span>White win —</span><span>Draw —</span><span>Black win —</span></div>
         <div id="bar"><span id="white"></span><span id="draw"></span><span id="black"></span></div>
         <div class="row"><button id="human">${studyReviewPage() ? 'Human style' : 'Enable human moves'}: ${engineMode === 'maia' ? 'ON' : 'OFF'}</button></div>
-        <div class="row"><button id="auto" ${engineMode === 'maia' ? '' : 'hidden'}>${studyReviewPage() ? 'Auto-play' : 'Auto-play Maia'}: ${autoPlay ? 'ON' : 'OFF'}</button></div>
-        <div class="row"><button id="next" ${engineMode === 'maia' ? '' : 'hidden'}>Auto next bot game: ${autoNextBot ? 'ON' : 'OFF'}</button></div>
+        <div class="row"><button id="auto">Auto-play: ${autoPlay ? 'ON' : 'OFF'}</button></div>
+        <div class="row"><button id="next">Auto next bot game: ${autoNextBot ? 'ON' : 'OFF'}</button></div>
         <div class="row"><button id="off">Streamer Mode: ON · Turn off</button></div></main></body></html>`);
       popup.document.close();
       const miniBoard = popup.document.getElementById('mini-board');
@@ -2178,9 +2182,7 @@
         popup.document.querySelector('h1').textContent = state.study ? 'Board Studio' :
           state.engineMode === 'maia' ? 'Maia 79M · Human moves' : 'Stockfish 19';
         popup.document.getElementById('human').textContent = `${state.study ? 'Human style' : 'Enable human moves'}: ${state.engineMode === 'maia' ? 'ON' : 'OFF'}`;
-        popup.document.getElementById('auto').hidden = state.engineMode !== 'maia';
-        popup.document.getElementById('auto').textContent = `${state.study ? 'Auto-play' : 'Auto-play Maia'}: ${state.autoPlay ? 'ON' : 'OFF'}`;
-        popup.document.getElementById('next').hidden = state.engineMode !== 'maia';
+        popup.document.getElementById('auto').textContent = `Auto-play: ${state.autoPlay ? 'ON' : 'OFF'}`;
         popup.document.getElementById('next').textContent = `Auto next bot game: ${state.autoNextBot ? 'ON' : 'OFF'}`;
         popup.document.getElementById('status').textContent = state.status;
         popup.document.getElementById('depth').textContent = state.engineMode === 'maia'
@@ -2243,11 +2245,11 @@
     const study = studyReviewPage();
     humanButton.textContent = `${study ? 'Human style' : 'Enable human moves'}: ${maia ? 'ON' : 'OFF'}`;
     humanButton.title = study ? 'Choose human probability model or precision search' : 'Switch between Maia 3 and Stockfish 19';
-    autoButton.textContent = `${study ? 'Auto-play' : 'Auto-play Maia'}: ${autoPlay ? 'ON' : 'OFF'}`;
-    autoSideEl.setAttribute('aria-label', study ? 'Side for auto-play' : 'Side for Maia auto-play');
+    autoButton.textContent = `Auto-play: ${autoPlay ? 'ON' : 'OFF'}`;
+    autoSideEl.setAttribute('aria-label', 'Your side for arrows and auto-play');
     nextButton.textContent = `Auto next bot game: ${autoNextBot ? 'ON' : 'OFF'}`;
-    panel.querySelector('#maia-web-auto-row').hidden = !maia;
-    panel.querySelector('#maia-web-next-row').hidden = !maia;
+    panel.querySelector('#maia-web-auto-row').hidden = false;
+    panel.querySelector('#maia-web-next-row').hidden = false;
     panel.querySelector('#maia-web-head span').textContent = study ? 'Board Studio' :
       maia ? 'Maia 79M · Human moves' : 'Stockfish 19';
     panel.querySelector('#maia-web-stockfish-settings').hidden = maia;
@@ -2306,7 +2308,6 @@
     else startEngine();
   });
   autoButton.addEventListener('click', () => {
-    if (engineMode !== 'maia') return;
     autoPlay = !autoPlay;
     saveSetting('maia-autoplay', autoPlay);
     syncEngineUi();
@@ -2317,7 +2318,6 @@
     if (autoPlay && game && shownMoves[0]) maybeAutoPlay(game.fen(), shownMoves[0].uci);
   });
   nextButton.addEventListener('click', () => {
-    if (engineMode !== 'maia') return;
     autoNextBot = !autoNextBot;
     saveSetting('maia-auto-next-bot', autoNextBot);
     syncEngineUi();
@@ -2328,6 +2328,8 @@
     clearTimeout(autoPlayTimer);
     autoPlayToken++;
     autoPlayedFen = '';
+    drawArrows();
+    publishStreamState();
     if (autoPlay && game && shownMoves[0]) maybeAutoPlay(game.fen(), shownMoves[0].uci);
   });
   panel.querySelector('#maia-web-research-run').addEventListener('click', startPostgameResearch);
