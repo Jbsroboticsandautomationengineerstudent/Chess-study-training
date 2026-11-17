@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stockfish 19 / Maia 3 Chess Board Assistant
 // @namespace    https://github.com/Jbsroboticsandautomationengineerstudent/Chess-study-training
-// @version      1.5.1
+// @version      1.5.2
 // @description  Switchable Stockfish 19 and Maia 3 board analysis
 // @match        https://www.chess.com/*
 // @match        https://chess.com/*
@@ -112,6 +112,7 @@
   let reviewSignature = '';
   let lastStudyRoute = null;
   let liveReview = [];
+  const liveCategoryByFen = new Map();
   let livePending = null;
   let lastSearchResult = null;
   let showResearchResult = false;
@@ -184,6 +185,7 @@
     #maia-web-research .row input{flex:1;width:0;min-width:0}
     #maia-web-research .row select{max-width:95px}
     #maia-web-research-note{font-size:11px;color:#c6d5e4;white-space:pre-wrap}
+    #maia-web-category-list{display:grid;gap:2px;font:12px/1.4 ui-monospace,monospace}
     #maia-web-arrow-note{font-size:11px;color:#aebfd0;margin:3px 0 8px}
     @media(max-width:600px){#maia-web-panel{top:68px;right:8px}}
   `;
@@ -211,6 +213,7 @@
         <div id="maia-web-review-current"></div><div id="maia-web-category-lines"></div>
         <div id="maia-web-review-legend" class="review-legend"></div></div>
       <ol id="maia-web-moves"></ol>
+      <div id="maia-web-category-list"></div>
       <div id="maia-web-arrow-note" hidden></div>
       <div id="maia-web-value"><div id="maia-web-value-label"><span>White win —</span><span>Draw —</span><span>Black win —</span></div>
         <div id="maia-web-value-bar" role="img" aria-label="Estimated win probabilities"><span id="maia-web-white"></span><span id="maia-web-draw"></span><span id="maia-web-black"></span></div></div>
@@ -242,6 +245,7 @@
   const autoSideEl = panel.querySelector('#maia-web-auto-side');
   const openingEl = panel.querySelector('#maia-web-opening');
   const movesEl = panel.querySelector('#maia-web-moves');
+  const categoryListEl = panel.querySelector('#maia-web-category-list');
   const arrowNoteEl = panel.querySelector('#maia-web-arrow-note');
   const fenEl = panel.querySelector('#maia-web-fen');
   const researchNoteEl = panel.querySelector('#maia-web-research-note');
@@ -286,6 +290,8 @@
     pendingSearch = null;
     lastFen = '';
     movesEl.replaceChildren();
+    categoryListEl.replaceChildren();
+    arrowNoteEl.hidden = true;
     shownMoves = [];
     shownValue = null;
     valueLabels.forEach((label, index) => { label.textContent = `${['White win', 'Draw', 'Black win'][index]} —`; });
@@ -552,10 +558,17 @@
     }
     arrow.replaceChildren();
     const displayMoves = displayArrowMoves(moves);
+    categoryListEl.replaceChildren();
+    for (const move of displayMoves.filter(candidate => candidate.category)) {
+      const line = document.createElement('div');
+      line.textContent = `${move.icon} ${move.category} · ${move.uci} · ${move.label}`;
+      line.style.color = move.color;
+      categoryListEl.appendChild(line);
+    }
     arrowNoteEl.hidden = !studyReviewPage();
     arrowNoteEl.textContent = displayMoves.some(move => move.category)
-      ? 'Category colors come from completed all-move review at this position.'
-      : 'For move-quality arrows, analyze a PGN and open a matching position.';
+      ? 'Category colors use every legal move; live labels may change as search deepens.'
+      : 'Move-quality arrows appear after the full legal-move search reaches this position.';
     const recent = botGamePage() ? liveReview[liveReview.length - 1] : null;
     let drawn = false;
     if (board) for (const move of [...displayMoves].reverse())
@@ -1225,7 +1238,7 @@
     if (!studyReviewPage() || !game) return [];
     const position = reviewEntries().find(item => item.fen === game.fen() && item.complete &&
       item.moves?.length === item.legalCount &&
-      item.moves.every(move => Number.isFinite(move.cp)));
+      item.moves.every(move => Number.isFinite(move.cp))) || liveCategoryByFen.get(game.fen());
     if (!position) return [];
     const best = position.moves[0], secondCp = position.moves[1]?.cp;
     const representatives = new Map();
@@ -1456,7 +1469,8 @@
   function beginSearch() {
     if (engineMode !== 'stockfish' || !engineReady || activeSearch || !pendingSearch || !worker || researchJob) return;
     activeSearch = {...pendingSearch, stale: false, evaluation: null, reachedDepth: 0,
-      lines: new Map(), multipv: studyReviewPage() ? Math.min(3, game.moves().length) : 1,
+      lines: new Map(), categoryDepth: 0,
+      multipv: studyReviewPage() ? game.moves().length : 1,
       legal: new Set(game.moves({verbose: true}).map(move => `${move.from}${move.to}${move.promotion || ''}`))};
     pendingSearch = null;
     worker.postMessage(`setoption name MultiPV value ${activeSearch.multipv}`);
@@ -1479,6 +1493,23 @@
         worker.postMessage('stop');
       }
     } else beginSearch();
+  }
+  function refreshLiveCategories(search) {
+    if (!studyReviewPage() || search.multipv < 2 || search.lines.size !== search.multipv) return;
+    const lines = [...search.lines.values()];
+    const commonDepth = Math.min(...lines.map(move => move.depth));
+    if (commonDepth < 4 || commonDepth <= search.categoryDepth ||
+        !lines.every(move => Number.isFinite(move.evaluation?.cp)) ||
+        new Set(lines.map(move => move.uci)).size !== search.multipv) return;
+    search.categoryDepth = commonDepth;
+    const moves = lines.map(move => ({uci: move.uci, cp: move.evaluation.cp, depth: move.depth}))
+      .sort((a, b) => b.cp - a.cp);
+    liveCategoryByFen.delete(search.fen);
+    liveCategoryByFen.set(search.fen, {fen: search.fen, complete: true,
+      legalCount: search.multipv, depth: commonDepth, moves});
+    if (liveCategoryByFen.size > 32) liveCategoryByFen.delete(liveCategoryByFen.keys().next().value);
+    drawArrows();
+    publishStreamState();
   }
   function engineLine(line) {
     if (engineMode !== 'stockfish') return;
@@ -1516,6 +1547,7 @@
         const previous = activeSearch.lines.get(rank);
         if (!previous || reachedDepth >= previous.depth)
           activeSearch.lines.set(rank, {uci: pv, depth: reachedDepth, evaluation});
+        refreshLiveCategories(activeSearch);
       }
       if (rank !== 1) return;
       if (reachedDepth < activeSearch.reachedDepth) return;
@@ -1535,7 +1567,7 @@
         `${move.from}${move.to}${move.promotion || ''}` === best);
       if (best && legal) {
         const candidates = [{uci: best, rank: 1, evaluation: finished.evaluation}];
-        if (studyReviewPage()) for (let rank = 2; rank <= finished.multipv; rank++) {
+        if (studyReviewPage()) for (let rank = 2; rank <= Math.min(3, finished.multipv); rank++) {
           const alternative = finished.lines.get(rank);
           if (alternative?.depth < finished.reachedDepth || !alternative ||
               candidates.some(move => move.uci === alternative.uci)) continue;
@@ -1801,18 +1833,14 @@
     if (!streamerMode || !streamChannel) return;
     const entries = reviewEntries();
     const totals = reviewSummary(entries);
-    const recent = botGamePage() ? liveReview[liveReview.length - 1] : null;
-    const recentVisual = recent?.review && recent.postFen === game?.fen()
-      ? REVIEW_PALETTE[recent.review.category] : null;
     const state = {type: 'state', status: statusEl.textContent, opening: openingName,
       fen: game?.fen() || '', blackView: board ? isBlackView() : lastBoardOrientation,
       skin: captureBoardSkin(),
       engineMode, depth, maiaRating, autoPlay, autoNextBot, study: studyReviewPage(),
-      moves: displayArrowMoves().map(move =>
+      moves: shownMoves.slice(0, 1).map(move =>
         ({uci: move.uci, label: move.label, metric: move.metric, color: move.color,
           icon: move.icon, opacity: move.opacity, rank: move.rank, category: move.category})),
-      recent: recentVisual ? {uci: recent.played, label: `${recent.review.accuracy.toFixed(0)}%`,
-        color: recentVisual.color, icon: recentVisual.icon} : null,
+      recent: null,
       review: studyReviewPage() && entries.some(item => item.review) ? {
         white: totals.w.count ? totals.w.sum / totals.w.count : null,
         black: totals.b.count ? totals.b.sum / totals.b.count : null} : null,
@@ -1913,7 +1941,7 @@
         renderMiniBoard(popup.document, state.fen, state.blackView, state.moves, state.skin, state.recent);
         const list = popup.document.getElementById('moves');
         list.replaceChildren();
-        for (const move of state.moves.slice(0, 10)) {
+        for (const move of state.moves.slice(0, 1)) {
           const item = popup.document.createElement('li');
           item.textContent = move.label ? `${move.uci} · ${move.metric || 'Score'} ${move.label}` :
             `${move.uci} · WDL unavailable`;
