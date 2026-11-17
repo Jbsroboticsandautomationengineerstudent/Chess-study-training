@@ -1,14 +1,18 @@
 // ==UserScript==
 // @name         Stockfish 19 Chess Board Assistant
 // @namespace    https://github.com/Jbsroboticsandautomationengineerstudent/Chess-study-training
-// @version      1.2.0
-// @description  Stockfish 19 WASM board analysis and post-game move research
+// @version      1.3.0
+// @description  Switchable Stockfish 19 and Maia 3 board analysis
 // @match        https://www.chess.com/*
 // @match        https://chess.com/*
 // @run-at       document-idle
 // @inject-into  content
 // @require      https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js
+// @require      https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/ort.webgpu.min.js
 // @connect      unpkg.com
+// @connect      huggingface.co
+// @connect      cas-bridge.xethub.hf.co
+// @connect      cdn-lfs.hf.co
 // @grant        GM_xmlhttpRequest
 // ==/UserScript==
 
@@ -20,8 +24,12 @@
   const ENGINE_SCRIPT = `${ENGINE_BASE}stockfish-19-single.js`;
   const ENGINE_WASM = `${ENGINE_BASE}stockfish-19-single.wasm`;
   const ENGINE_CACHE = 'stockfish-19-assets-v1';
+  const MAIA_MODEL_URL = 'https://huggingface.co/cstr/maia3-onnx-int32/resolve/main/maia3_79m_int32.onnx';
+  const MAIA_MODEL_MIN_BYTES = 300_000_000;
+  const ORT_DIST = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/';
   const RESEARCH_DEPTH = 18;
   const ChessClass = typeof Chess !== 'undefined' ? Chess : window.Chess;
+  const ortApi = typeof ort !== 'undefined' ? ort : window.ort;
   if (!ChessClass) {
     console.error('[Stockfish 19] chess.js did not load. Check the userscript manager and CDN access.');
     return;
@@ -38,6 +46,16 @@
   let engineError = '';
   let engineCached = false;
   let cacheAvailable = true;
+  let engineMode = 'stockfish';
+  let engineGeneration = 0;
+  let maiaGeneration = 0;
+  let maiaSession = null;
+  let maiaLoading = null;
+  let maiaRun = null;
+  let maiaError = '';
+  let maiaBackend = '';
+  let maiaRating = 2600;
+  let inferenceId = 0;
   let depth = 11;
   let autoPlay = false;
   let autoPlayedFen = '';
@@ -76,11 +94,12 @@
       font-weight:700;cursor:grab;touch-action:none;user-select:none;display:flex;justify-content:space-between}
     #maia-web-panel .body{padding:10px 12px}
     #maia-web-panel .row{display:flex;align-items:center;gap:7px;margin-bottom:7px}
+    #maia-web-panel [hidden]{display:none!important}
     #maia-web-panel select,#maia-web-panel input,#maia-web-panel button{
       color:#fff;background:#33485d;border:1px solid #708296;border-radius:5px;padding:4px 6px;font:inherit}
     #maia-web-panel button{cursor:pointer}
-    #maia-web-depth{width:auto;min-width:0;flex:1;accent-color:#24dc83}
-    #maia-web-depth-label{min-width:25px;text-align:right;font-variant-numeric:tabular-nums}
+    #maia-web-depth,#maia-web-rating{width:auto;min-width:0;flex:1;accent-color:#24dc83}
+    #maia-web-depth-label,#maia-web-rating-label{min-width:25px;text-align:right;font-variant-numeric:tabular-nums}
     #maia-web-panel input{width:100%;font:11px/1.4 ui-monospace,monospace}
     #maia-web-status{color:#c6d5e4;min-height:32px;margin:5px 0;white-space:pre-wrap}
     #maia-web-opening{color:#a9dbc2;font-size:12px;min-height:18px;margin:3px 0}
@@ -107,8 +126,11 @@
   panel.innerHTML = `
     <div id="maia-web-head"><span>Stockfish 19</span><span>drag</span></div>
     <div class="body">
-      <div class="row"><label for="maia-web-depth">Depth</label><input id="maia-web-depth" type="range" min="10" max="25" value="11"><span id="maia-web-depth-label">11</span></div>
-      <div class="row" title="Full single-threaded build; no strength handicap. Elo is not fixed by depth.">Full build · Max skill · Elo varies</div>
+      <div class="row"><button id="maia-web-human" title="Maia human-like predictions on bot and analysis boards">Enable human moves: OFF</button></div>
+      <div class="row" id="maia-web-stockfish-settings"><label for="maia-web-depth">Depth</label><input id="maia-web-depth" type="range" min="10" max="25" value="11"><span id="maia-web-depth-label">11</span></div>
+      <div class="row" id="maia-web-stockfish-strength" title="Full single-threaded build; no strength handicap. Elo is not fixed by depth.">Full build · Max skill · Elo varies</div>
+      <div class="row" id="maia-web-maia-settings" hidden><label for="maia-web-rating">Maia rating</label><input id="maia-web-rating" type="range" min="600" max="2600" step="100" value="2600"><span id="maia-web-rating-label">2600</span></div>
+      <div class="row" id="maia-web-maia-note" hidden>Maia 79M · one prediction pass; no search depth</div>
       <div class="row"><button id="maia-web-autoplay">Auto-play bots: OFF</button>
         <select id="maia-web-auto-side" aria-label="Side for bot auto-play"><option value="bottom">Bottom side</option><option value="w">White</option><option value="b">Black</option></select></div>
       <div class="row"><button id="maia-web-flip" title="Reverse arrow orientation">Flip</button></div>
@@ -137,6 +159,9 @@
   const statusEl = panel.querySelector('#maia-web-status');
   const depthEl = panel.querySelector('#maia-web-depth');
   const depthLabelEl = panel.querySelector('#maia-web-depth-label');
+  const humanButton = panel.querySelector('#maia-web-human');
+  const ratingEl = panel.querySelector('#maia-web-rating');
+  const ratingLabelEl = panel.querySelector('#maia-web-rating-label');
   const autoButton = panel.querySelector('#maia-web-autoplay');
   const autoSideEl = panel.querySelector('#maia-web-auto-side');
   const openingEl = panel.querySelector('#maia-web-opening');
@@ -160,6 +185,7 @@
     }
   }
   function clearPrediction() {
+    inferenceId++;
     if (activeSearch && worker) {
       activeSearch.stale = true;
       worker.postMessage('stop');
@@ -402,28 +428,45 @@
   function botAutoPlayAllowed() {
     return /^\/play\/computer(?:\/|$)/.test(location.pathname);
   }
+  function maiaBoardAllowed() {
+    return botAutoPlayAllowed() || /^\/analysis(?:\/|$)/.test(location.pathname);
+  }
   function autoSide() {
     return autoSideEl.value === 'bottom' ? (isBlackView() ? 'b' : 'w') : autoSideEl.value;
   }
-  function clickBoardSquare(square) {
+  function boardTarget(square) {
     if (!board?.isConnected) return false;
     const point = squarePoint(square, isBlackView());
     const rect = board.getBoundingClientRect();
     const x = rect.left + rect.width * point.x / 100;
     const y = rect.top + rect.height * point.y / 100;
     const target = document.elementFromPoint(x, y);
-    if (!target || !board.contains(target)) return false;
+    return target && board.contains(target) ? {target, x, y} : null;
+  }
+  function boardEvent(position, type, pressed) {
     const options = {bubbles: true, cancelable: true, composed: true,
-      clientX: x, clientY: y, button: 0, buttons: 1};
-    if (typeof PointerEvent === 'function') {
-      target.dispatchEvent(new PointerEvent('pointerdown', {...options, pointerId: 1, pointerType: 'mouse', isPrimary: true}));
-    }
-    target.dispatchEvent(new MouseEvent('mousedown', options));
-    if (typeof PointerEvent === 'function') {
-      target.dispatchEvent(new PointerEvent('pointerup', {...options, buttons: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true}));
-    }
-    target.dispatchEvent(new MouseEvent('mouseup', {...options, buttons: 0}));
-    target.dispatchEvent(new MouseEvent('click', {...options, buttons: 0}));
+      clientX: position.x, clientY: position.y, button: 0, buttons: pressed ? 1 : 0};
+    if (typeof PointerEvent === 'function')
+      position.target.dispatchEvent(new PointerEvent(`pointer${type}`, {...options,
+        pointerId: 1, pointerType: 'mouse', isPrimary: true}));
+    position.target.dispatchEvent(new MouseEvent(`mouse${type}`, options));
+  }
+  function clickBoardSquare(square) {
+    const position = boardTarget(square);
+    if (!position) return false;
+    boardEvent(position, 'down', true);
+    boardEvent(position, 'up', false);
+    position.target.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true,
+      composed: true, clientX: position.x, clientY: position.y, button: 0}));
+    return true;
+  }
+  function dragBoardMove(uci) {
+    const from = boardTarget(uci.slice(0, 2));
+    const to = boardTarget(uci.slice(2, 4));
+    if (!from || !to) return false;
+    boardEvent(from, 'down', true);
+    boardEvent(to, 'move', true);
+    boardEvent(to, 'up', false);
     return true;
   }
   function choosePromotion(uci) {
@@ -446,10 +489,17 @@
       if (!moved) { setStatus('Auto-play could not reach the board. Move manually.'); return; }
       if (uci.length === 5) setTimeout(() => choosePromotion(uci), 50);
       setTimeout(() => {
+        if (autoPlay && botAutoPlayAllowed() && game?.fen() === fen &&
+            piecesFrom(board) === fen.split(' ')[0]) {
+          dragBoardMove(uci);
+          if (uci.length === 5) setTimeout(() => choosePromotion(uci), 50);
+        }
+      }, 450);
+      setTimeout(() => {
         scan();
         if (autoPlay && game?.fen() === fen)
           setStatus('Chess.com did not accept the automatic move. Move manually.');
-      }, 900);
+      }, 1200);
     }, 0);
   }
 
@@ -621,7 +671,13 @@
     if (!game) return;
     const fen = game.fen();
     if (fenEl.textContent !== fen) fenEl.textContent = fen;
-    if (engineReady && !researchJob) requestAnalysis(fen);
+    if (engineMode === 'maia') {
+      if (!maiaBoardAllowed()) {
+        if (shownMoves.length) clearPrediction();
+        setStatus('Maia human-move hints are available on bot games and analysis boards.');
+      } else if (maiaSession) void predictMaia(fen);
+      else if (maiaError) setStatus(maiaError);
+    } else if (engineReady && !researchJob) requestAnalysis(fen);
     else if (engineError) setStatus(engineError);
     keepArrowAligned();
     publishStreamState();
@@ -629,6 +685,197 @@
   function scheduleScan() {
     clearTimeout(scanTimer);
     scanTimer = setTimeout(scan, 60);
+  }
+
+  function boardTokens(fen) {
+    const tokens = new Float32Array(64 * 96);
+    const [placement, side] = fen.split(' ');
+    const channels = {p: 0, n: 1, b: 2, r: 3, q: 4, k: 5};
+    placement.split('/').forEach((rankText, row) => {
+      let file = 0;
+      for (const piece of rankText) {
+        if (/^[1-8]$/.test(piece)) { file += Number(piece); continue; }
+        const square = (7 - row) * 8 + file++;
+        const mappedSquare = side === 'b' ? square ^ 56 : square;
+        const isBlack = piece === piece.toLowerCase();
+        const mappedBlack = side === 'b' ? !isBlack : isBlack;
+        const channel = channels[piece.toLowerCase()] + (mappedBlack ? 6 : 0);
+        for (let history = 0; history < 8; history++)
+          tokens[mappedSquare * 96 + history * 12 + channel] = 1;
+      }
+    });
+    return tokens;
+  }
+  function moveIndex(move, blackToMove) {
+    const mirror = square => blackToMove ? `${square[0]}${9 - Number(square[1])}` : square;
+    const from = mirror(move.from), to = mirror(move.to);
+    const ff = from.charCodeAt(0) - 97, fr = Number(from[1]) - 1;
+    const tf = to.charCodeAt(0) - 97, tr = Number(to[1]) - 1;
+    if (move.promotion) {
+      const promotion = 'qrbn'.indexOf(move.promotion);
+      return promotion < 0 || fr !== 6 || tr !== 7 ? -1 : 4096 + ff * 32 + tf * 4 + promotion;
+    }
+    return (fr * 8 + ff) * 64 + (tr * 8 + tf);
+  }
+  function maiaRatingTensor(name) {
+    const index = maiaSession.inputNames.indexOf(name);
+    const type = maiaSession.inputMetadata?.[index]?.type || 'tensor(int32)';
+    if (type === 'int64' || type === 'tensor(int64)')
+      return new ortApi.Tensor('int64', BigInt64Array.of(BigInt(maiaRating)), [1]);
+    if (type === 'int32' || type === 'tensor(int32)')
+      return new ortApi.Tensor('int32', Int32Array.of(maiaRating), [1]);
+    throw new Error(`${name} has unsupported type ${type}`);
+  }
+  function showMaiaValue(logits, blackToMove) {
+    if (!logits || logits.length !== 3 || !Array.from(logits).every(Number.isFinite)) {
+      shownValue = null;
+      valueLabels.forEach((label, index) => { label.textContent = `${['White win', 'Draw', 'Black win'][index]} —`; });
+      valueSegments.forEach(segment => { segment.style.width = '0%'; });
+      return;
+    }
+    const largest = Math.max(...logits);
+    const weights = Array.from(logits, value => Math.exp(value - largest));
+    const total = weights.reduce((sum, value) => sum + value, 0);
+    const [loss, draw, win] = weights.map(value => 100 * value / total);
+    shownValue = blackToMove ? [loss, draw, win] : [win, draw, loss];
+    valueLabels.forEach((label, index) => {
+      label.textContent = `${['White win', 'Draw', 'Black win'][index]} ${shownValue[index].toFixed(1)}%`;
+    });
+    valueSegments.forEach((segment, index) => { segment.style.width = `${shownValue[index]}%`; });
+  }
+  async function legacyMaiaModel() {
+    try {
+      const db = await new Promise((resolve, reject) => {
+        const request = indexedDB.open('maia-onnx-cache', 1);
+        request.onupgradeneeded = () => request.result.createObjectStore('models');
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      try {
+        return await new Promise((resolve, reject) => {
+          const request = db.transaction('models', 'readonly').objectStore('models').get(MAIA_MODEL_URL);
+          request.onsuccess = () => resolve(request.result instanceof Blob ? request.result : null);
+          request.onerror = () => reject(request.error);
+        });
+      } finally { db.close(); }
+    } catch { return null; }
+  }
+  async function loadMaia() {
+    if (engineMode !== 'maia') return;
+    if (maiaSession) { scan(); return; }
+    if (maiaLoading) {
+      await maiaLoading;
+      if (engineMode === 'maia' && !maiaSession && !maiaError) return loadMaia();
+      return;
+    }
+    if (!ortApi) { maiaError = 'ONNX Runtime did not load. Check the userscript CDN.'; setStatus(maiaError); return; }
+    const generation = maiaGeneration;
+    maiaError = '';
+    maiaLoading = (async () => {
+      ortApi.env.wasm.wasmPaths = ORT_DIST;
+      ortApi.env.wasm.numThreads = 1;
+      setStatus('Checking saved Maia 79M model…');
+      let blob = await cachedAsset(MAIA_MODEL_URL) || await legacyMaiaModel();
+      if (generation !== maiaGeneration || engineMode !== 'maia') return;
+      if (blob && blob.size < MAIA_MODEL_MIN_BYTES) blob = null;
+      if (!blob) {
+        setStatus('Downloading Maia 79M model…');
+        blob = await downloadAsset(MAIA_MODEL_URL, (loaded, total) => {
+          if (generation !== maiaGeneration) return;
+          const size = total > 0 && loaded <= total ? total : 313_000_000;
+          setStatus(`Downloading Maia 79M: ${Math.min(100, Math.floor(100 * loaded / size))}% (${(loaded / 1e6).toFixed(0)} MB)`);
+        });
+        if (blob.size < MAIA_MODEL_MIN_BYTES) throw new Error('Maia model download was incomplete.');
+        if (generation === maiaGeneration) {
+          setStatus('Saving Maia 79M model…');
+          await saveEngineAsset(MAIA_MODEL_URL, blob);
+        }
+      }
+      if (generation !== maiaGeneration || engineMode !== 'maia') return;
+      const bytes = await blob.arrayBuffer();
+      if (generation !== maiaGeneration || engineMode !== 'maia') return;
+      let loaded = null, backend = 'CPU';
+      if (navigator.gpu) {
+        try {
+          setStatus('Initializing Maia 79M on WebGPU…');
+          loaded = await ortApi.InferenceSession.create(bytes, {executionProviders: ['webgpu', 'wasm']});
+          backend = 'WebGPU';
+        } catch (error) { console.warn('[Maia] WebGPU unavailable; using CPU:', error); }
+      }
+      if (!loaded) {
+        setStatus('Initializing Maia 79M on CPU…');
+        loaded = await ortApi.InferenceSession.create(bytes, {executionProviders: ['wasm']});
+      }
+      if (generation !== maiaGeneration || engineMode !== 'maia') { await loaded.release?.(); return; }
+      if (!['tokens', 'self_elo', 'oppo_elo'].every(name => loaded.inputNames.includes(name)) ||
+          !loaded.outputNames.some(name => name === 'logits_move' || name === 'move_logits')) {
+        await loaded.release?.();
+        throw new Error('Maia model input/output names do not match its published contract.');
+      }
+      maiaSession = loaded;
+      maiaBackend = backend;
+      setStatus(`Maia 79M ready on ${backend}. Scanning board…`);
+      lastFen = '';
+      scan();
+    })().catch(error => {
+      if (generation !== maiaGeneration || engineMode !== 'maia') return;
+      maiaError = `Maia 79M failed: ${error.message}`;
+      setStatus(maiaError);
+    }).finally(() => { maiaLoading = null; });
+    return maiaLoading;
+  }
+  async function predictMaia(fen) {
+    if (engineMode !== 'maia' || !maiaBoardAllowed() || !maiaSession || maiaRun || !game || fen === lastFen) return;
+    lastFen = fen;
+    const id = ++inferenceId;
+    const legal = game.moves({verbose: true});
+    if (!legal.length) { setStatus('No legal moves in this position.'); return; }
+    let run;
+    try {
+      const feeds = {
+        tokens: new ortApi.Tensor('float32', boardTokens(fen), [1, 64, 96]),
+        self_elo: maiaRatingTensor('self_elo'),
+        oppo_elo: maiaRatingTensor('oppo_elo')
+      };
+      setStatus('Maia 79M is predicting…');
+      run = maiaSession.run(feeds);
+      maiaRun = run;
+      const output = await run;
+      if (id !== inferenceId || engineMode !== 'maia' || !maiaBoardAllowed() || game?.fen() !== fen) return;
+      const logits = (output.logits_move || output.move_logits)?.data;
+      if (!logits || logits.length < 4352) throw new Error('Expected 4352 Maia move logits.');
+      const black = game.turn() === 'b';
+      const candidates = legal.map(move => {
+        const index = moveIndex(move, black);
+        return {uci: `${move.from}${move.to}${move.promotion || ''}`,
+          logit: index < 0 ? NaN : Number(logits[index])};
+      }).filter(move => Number.isFinite(move.logit));
+      if (!candidates.length) throw new Error('No legal move maps to the Maia output.');
+      candidates.sort((a, b) => b.logit - a.logit);
+      const largest = candidates[0].logit;
+      const total = candidates.reduce((sum, move) => sum + Math.exp(move.logit - largest), 0);
+      const best = candidates[0];
+      const percent = 100 / total;
+      shownMoves = [{uci: best.uci, label: `${percent.toFixed(1)}%`}];
+      movesEl.replaceChildren();
+      const item = document.createElement('li');
+      item.textContent = `${best.uci} (${percent.toFixed(1)}%)`;
+      movesEl.appendChild(item);
+      showMaiaValue(output.logits_value?.data, black);
+      drawArrows();
+      setStatus(`Maia 79M · ${maiaBackend} · rating ${maiaRating} · ${black ? 'Black' : 'White'} to move`);
+      publishStreamState();
+      maybeAutoPlay(fen, best.uci);
+    } catch (error) {
+      if (id === inferenceId && engineMode === 'maia') {
+        clearPrediction();
+        lastFen = fen;
+        setStatus(`Maia inference failed: ${error.message}`);
+      }
+    } finally {
+      if (maiaRun === run) maiaRun = null;
+      if (engineMode === 'maia') scan();
+    }
   }
 
   function scaledValue(pawns) {
@@ -680,6 +927,7 @@
   }
   function startPostgameResearch() {
     if (researchJob) return;
+    if (engineMode !== 'stockfish') { researchNoteEl.textContent = 'Turn Human moves OFF to use Stockfish post-game research.'; return; }
     if (!engineReady || !worker) { researchNoteEl.textContent = 'Stockfish 19 must finish loading first.'; return; }
     const pgn = panel.querySelector('#maia-web-pgn').value.trim();
     const side = panel.querySelector('#maia-web-research-side').value;
@@ -808,7 +1056,7 @@
   }
 
   function beginSearch() {
-    if (!engineReady || activeSearch || !pendingSearch || !worker || researchJob) return;
+    if (engineMode !== 'stockfish' || !engineReady || activeSearch || !pendingSearch || !worker || researchJob) return;
     activeSearch = {...pendingSearch, stale: false, evaluation: null, reachedDepth: 0};
     pendingSearch = null;
     worker.postMessage(`position fen ${activeSearch.fen}`);
@@ -816,7 +1064,7 @@
     setStatus(`Stockfish 19 · analyzing depth ${activeSearch.depth}…`);
   }
   function requestAnalysis(fen) {
-    if (!engineReady || !game || researchJob || fen === lastFen) return;
+    if (engineMode !== 'stockfish' || !engineReady || !game || researchJob || fen === lastFen) return;
     if (!game.moves().length) {
       lastFen = fen;
       setStatus('No legal moves in this position.');
@@ -832,6 +1080,7 @@
     } else beginSearch();
   }
   function engineLine(line) {
+    if (engineMode !== 'stockfish') return;
     if (line === 'uciok') {
       worker.postMessage('setoption name Hash value 32');
       worker.postMessage('setoption name MultiPV value 1');
@@ -954,14 +1203,25 @@
   async function loadEngineAsset(url, label, onProgress) {
     const saved = await cachedAsset(url);
     if (saved) return {blob: saved, cached: true};
-    setStatus(`Downloading Stockfish 19 ${label}…`);
+    if (engineMode === 'stockfish') setStatus(`Downloading Stockfish 19 ${label}…`);
     const blob = await downloadAsset(url, onProgress);
-    setStatus(`Saving Stockfish 19 ${label} for future visits…`);
+    if (engineMode === 'stockfish') setStatus(`Saving Stockfish 19 ${label} for future visits…`);
     await saveEngineAsset(url, blob);
     return {blob, cached: false};
   }
+  function stopStockfishEngine() {
+    engineGeneration++;
+    worker?.terminate();
+    worker = null;
+    if (workerUrl) URL.revokeObjectURL(workerUrl);
+    if (wasmBlobUrl) URL.revokeObjectURL(wasmBlobUrl);
+    workerUrl = wasmBlobUrl = '';
+    engineReady = engineStarting = false;
+    activeSearch = pendingSearch = null;
+  }
   async function startEngine() {
-    if (engineStarting || engineReady) return;
+    if (engineMode !== 'stockfish' || engineStarting || engineReady) return;
+    const generation = ++engineGeneration;
     if (worker) worker.terminate();
     if (workerUrl) URL.revokeObjectURL(workerUrl);
     if (wasmBlobUrl) URL.revokeObjectURL(wasmBlobUrl);
@@ -976,12 +1236,15 @@
     setStatus('Checking saved Stockfish 19 engine…');
     try {
       const scriptAsset = await loadEngineAsset(ENGINE_SCRIPT, 'script');
+      if (generation !== engineGeneration || engineMode !== 'stockfish') return;
       const wasmAsset = await loadEngineAsset(ENGINE_WASM, 'WASM', (loaded, total) => {
+        if (generation !== engineGeneration || engineMode !== 'stockfish') return;
         const progress = Number.isFinite(total) && total > 0 && loaded <= total
           ? `${Math.min(100, Math.floor(100 * loaded / total))}%`
           : `${(Math.max(0, loaded) / 1e6).toFixed(1)} MB`;
         setStatus(`Downloading Stockfish 19 WASM: ${progress}`);
       });
+      if (generation !== engineGeneration || engineMode !== 'stockfish') return;
       engineCached = scriptAsset.cached && wasmAsset.cached;
       setStatus(engineCached ? 'Loading saved Stockfish 19 engine…' : 'Starting Stockfish 19 engine…');
       workerUrl = URL.createObjectURL(new Blob([scriptAsset.blob], {type: 'text/javascript'}));
@@ -989,6 +1252,7 @@
       // The Stockfish worker accepts a WASM URL in its own URL fragment.
       worker = new Worker(`${workerUrl}#${encodeURIComponent(wasmBlobUrl)}`);
       worker.onmessage = event => {
+        if (generation !== engineGeneration || engineMode !== 'stockfish') return;
         for (const line of String(event.data).split(/\r?\n/)) {
           if (line === 'info WillOutputEngineDownloadProgress') {
             const channel = new MessageChannel();
@@ -1003,6 +1267,7 @@
         }
       };
       worker.onerror = event => {
+        if (generation !== engineGeneration || engineMode !== 'stockfish') return;
         engineStarting = engineReady = false;
         engineError = `Stockfish 19 failed to load: ${event.message || 'worker error'}`;
         setStatus(engineError);
@@ -1020,6 +1285,7 @@
       worker.postMessage('setoption name CanOutputEngineDownloadProgress');
       worker.postMessage('uci');
     } catch (error) {
+      if (generation !== engineGeneration || engineMode !== 'stockfish') return;
       engineStarting = engineReady = false;
       engineError = `Stockfish 19 failed to start: ${error.message}`;
       setStatus(engineError);
@@ -1061,7 +1327,7 @@
     const state = {type: 'state', status: statusEl.textContent, opening: openingName,
       fen: game?.fen() || '', blackView: board ? isBlackView() : lastBoardOrientation,
       skin: captureBoardSkin(),
-      depth, moves: shownMoves.map(move => ({uci: move.uci, label: move.label})),
+      engineMode, depth, maiaRating, moves: shownMoves.map(move => ({uci: move.uci, label: move.label})),
       value: shownValue ? [...shownValue] : null};
     const signature = JSON.stringify(state);
     if (signature === lastStreamSignature) return;
@@ -1094,7 +1360,7 @@
     if (!popup) { setStatus('Allow popups for Chess.com, then try Streamer Mode again.'); return; }
     try {
       popup.document.open();
-      popup.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>Stockfish 19 Streamer View</title>
+      popup.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>Chess Engine Streamer View</title>
         <style>body{margin:0;background:#121c28;color:#f6f8fb;font:14px/1.5 system-ui,-apple-system,sans-serif}
         main{padding:16px}h1{margin:0 0 14px;font-size:18px}.row{display:flex;align-items:center;gap:8px;margin:10px 0}
         button{background:#33485d;color:#fff;border:1px solid #708296;border-radius:6px;padding:7px;font:inherit;cursor:pointer}
@@ -1110,10 +1376,11 @@
         #mini-board .white-piece{color:#fff;text-shadow:0 1px 2px #111,1px 0 #111,-1px 0 #111}
         #mini-board .black-piece{color:#182018;text-shadow:0 1px 1px #fff9}
         #mini-arrow{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible}
-        </style></head><body><main><h1>Stockfish 19</h1><div id="status">Connecting…</div>
+        </style></head><body><main><h1>${engineMode === 'maia' ? 'Maia 79M' : 'Stockfish 19'}</h1><div id="status">Connecting…</div>
         <div id="depth">Depth: 11</div><div id="opening">Opening: —</div><div id="mini-board" aria-label="Current chess position"><svg id="mini-arrow" viewBox="0 0 100 100" aria-hidden="true"></svg></div>
         <ol id="moves"></ol><div id="labels"><span>White win —</span><span>Draw —</span><span>Black win —</span></div>
         <div id="bar"><span id="white"></span><span id="draw"></span><span id="black"></span></div>
+        <div class="row"><button id="human">Enable human moves: ${engineMode === 'maia' ? 'ON' : 'OFF'}</button></div>
         <div class="row"><button id="off">Streamer Mode: ON · Turn off</button></div></main></body></html>`);
       popup.document.close();
       const miniBoard = popup.document.getElementById('mini-board');
@@ -1129,19 +1396,23 @@
       popupChannel = new popup.BroadcastChannel(channelName);
       streamChannel.onmessage = event => {
         if (event.data?.type === 'off') stopStreamerMode();
+        if (event.data?.type === 'engine-toggle') humanButton.click();
       };
       popupChannel.onmessage = event => {
         if (event.data?.type !== 'state' || popup.closed) return;
         const state = event.data;
+        popup.document.querySelector('h1').textContent = state.engineMode === 'maia' ? 'Maia 79M · Human moves' : 'Stockfish 19';
+        popup.document.getElementById('human').textContent = `Enable human moves: ${state.engineMode === 'maia' ? 'ON' : 'OFF'}`;
         popup.document.getElementById('status').textContent = state.status;
-        popup.document.getElementById('depth').textContent = `Depth: ${state.depth}`;
+        popup.document.getElementById('depth').textContent = state.engineMode === 'maia'
+          ? `Maia rating: ${state.maiaRating} · single pass` : `Depth: ${state.depth}`;
         popup.document.getElementById('opening').textContent = `Opening: ${state.opening || '—'}`;
         renderMiniBoard(popup.document, state.fen, state.blackView, state.moves[0], state.skin);
         const list = popup.document.getElementById('moves');
         list.replaceChildren();
         for (const move of state.moves.slice(0, 1)) {
           const item = popup.document.createElement('li');
-          item.textContent = move.uci;
+          item.textContent = move.label ? `${move.uci} (${move.label})` : move.uci;
           list.appendChild(item);
         }
         const labels = popup.document.querySelectorAll('#labels span');
@@ -1151,6 +1422,7 @@
           segments[index].style.width = state.value ? `${state.value[index]}%` : '0%';
         });
       };
+      popup.document.getElementById('human').addEventListener('click', () => popupChannel.postMessage({type: 'engine-toggle'}));
       popup.document.getElementById('off').addEventListener('click', () => popupChannel.postMessage({type: 'off'}));
       streamPopup = popup;
       streamerMode = true;
@@ -1173,7 +1445,56 @@
       setStatus(`Streamer Mode failed: ${error.message}`);
     }
   }
-  panel.querySelector('#maia-web-retry').addEventListener('click', startEngine);
+  function syncEngineUi() {
+    const maia = engineMode === 'maia';
+    humanButton.textContent = `Enable human moves: ${maia ? 'ON' : 'OFF'}`;
+    panel.querySelector('#maia-web-head span').textContent = maia ? 'Maia 79M · Human moves' : 'Stockfish 19';
+    panel.querySelector('#maia-web-stockfish-settings').hidden = maia;
+    panel.querySelector('#maia-web-stockfish-strength').hidden = maia;
+    panel.querySelector('#maia-web-maia-settings').hidden = !maia;
+    panel.querySelector('#maia-web-maia-note').hidden = !maia;
+    panel.querySelector('#maia-web-retry').textContent = maia ? 'Load Maia' : 'Retry engine';
+    publishStreamState();
+  }
+  humanButton.addEventListener('click', () => {
+    if (researchJob) { setStatus('Finish or cancel post-game research before switching engines.'); return; }
+    if (engineMode === 'stockfish') {
+      if (!maiaBoardAllowed()) {
+        setStatus('Maia human-move hints are available on bot games and analysis boards.');
+        return;
+      }
+      engineMode = 'maia';
+      maiaGeneration++;
+      stopStockfishEngine();
+      autoPlayedFen = '';
+      clearPrediction();
+      syncEngineUi();
+      void loadMaia();
+    } else {
+      engineMode = 'stockfish';
+      maiaGeneration++;
+      const session = maiaSession;
+      maiaSession = null;
+      const running = maiaRun;
+      autoPlayedFen = '';
+      clearPrediction();
+      syncEngineUi();
+      setStatus('Switching to Stockfish 19…');
+      Promise.resolve(running).catch(() => {}).then(() => session?.release?.())
+        .catch(error => console.warn('[Maia] Session release failed:', error))
+        .finally(() => { if (engineMode === 'stockfish') { startEngine(); scan(); } });
+    }
+  });
+  ratingEl.addEventListener('input', () => {
+    maiaRating = Math.max(600, Math.min(2600, Number(ratingEl.value) || 2600));
+    ratingLabelEl.textContent = String(maiaRating);
+    if (engineMode === 'maia') { autoPlayedFen = ''; clearPrediction(); scan(); }
+    publishStreamState();
+  });
+  panel.querySelector('#maia-web-retry').addEventListener('click', () => {
+    if (engineMode === 'maia') void loadMaia();
+    else startEngine();
+  });
   autoButton.addEventListener('click', () => {
     if (!autoPlay && !botAutoPlayAllowed()) {
       setStatus('Auto-play is available only on Chess.com bot games (/play/computer).');
@@ -1208,8 +1529,11 @@
   depthEl.addEventListener('input', () => {
     depth = Math.max(10, Math.min(25, Number(depthEl.value) || 11));
     depthLabelEl.textContent = String(depth);
-    lastFen = '';
-    if (game) requestAnalysis(game.fen());
+    if (engineMode === 'stockfish') {
+      autoPlayedFen = '';
+      lastFen = '';
+      if (game) requestAnalysis(game.fen());
+    }
     publishStreamState();
   });
   panel.querySelector('#maia-web-rescan').addEventListener('click', () => {
