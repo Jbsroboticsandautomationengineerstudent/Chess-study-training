@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stockfish 19 / Maia 3 Chess Board Assistant
 // @namespace    https://github.com/Jbsroboticsandautomationengineerstudent/Chess-study-training
-// @version      1.5.4
+// @version      1.5.5
 // @description  Switchable Stockfish 19 and Maia 3 board analysis
 // @match        https://www.chess.com/*
 // @match        https://chess.com/*
@@ -30,6 +30,7 @@
   const MAIA_MODEL_MIN_BYTES = 300_000_000;
   const ORT_DIST = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/';
   const RESEARCH_DEPTH = 18;
+  const MAX_BOARD_ARROWS = 10;
   const TOP_MOVE_COLORS = ['#00008A', '#3273b7', '#7fa7d1'];
   const REVIEW_PALETTE = {
     Brilliant: {color: '#28c9bd', icon: '!!'}, Great: {color: '#6f9fca', icon: '!'},
@@ -570,13 +571,17 @@
   }
   function displayArrowMoves(moves = shownMoves) {
     const categories = categoryArrowsForBoard();
-    if (categories.length) return categories;
-    const display = moves.slice(0, multiArrowPage() ? 3 : 1);
+    const display = [];
+    for (const move of [...categories, ...moves]) {
+      if (display.length >= MAX_BOARD_ARROWS) break;
+      if (!display.some(existing => existing.uci === move.uci)) display.push(move);
+    }
     const reviewed = reviewMoveForBoard();
     if (reviewed) {
       const same = display.findIndex(move => move.uci === reviewed.uci);
       if (same >= 0) display[same] = reviewed;
-      else display.push(reviewed);
+      else if (display.length < MAX_BOARD_ARROWS) display.push(reviewed);
+      else display[display.length - 1] = reviewed;
     }
     return display;
   }
@@ -1183,10 +1188,10 @@
       const largest = candidates[0].logit;
       const total = candidates.reduce((sum, move) => sum + Math.exp(move.logit - largest), 0);
       const best = candidates[0];
-      shownMoves = candidates.slice(0, multiArrowPage() ? 3 : 1).map((candidate, rank) => ({
+      shownMoves = candidates.slice(0, multiArrowPage() ? MAX_BOARD_ARROWS : 1).map((candidate, rank) => ({
         uci: candidate.uci, label: `${(100 * Math.exp(candidate.logit - largest) / total).toFixed(1)}%`,
         metric: 'Move probability', rank: rank + 1,
-        color: TOP_MOVE_COLORS[rank], opacity: [1, 0.78, 0.62][rank]
+        color: TOP_MOVE_COLORS[rank] || '#9ebcda', opacity: Math.max(0.42, 1 - rank * 0.07)
       }));
       movesEl.replaceChildren();
       for (const move of shownMoves) {
@@ -1635,7 +1640,7 @@
         `${move.from}${move.to}${move.promotion || ''}` === best);
       if (best && legal) {
         const candidates = [{uci: best, rank: 1, evaluation: finished.evaluation}];
-        if (multiArrowPage()) for (let rank = 2; rank <= Math.min(3, finished.multipv); rank++) {
+        if (multiArrowPage()) for (let rank = 2; rank <= Math.min(MAX_BOARD_ARROWS, finished.multipv); rank++) {
           const alternative = finished.lines.get(rank);
           if (alternative?.depth < finished.reachedDepth || !alternative ||
               candidates.some(move => move.uci === alternative.uci)) continue;
@@ -1651,10 +1656,10 @@
           const visual = category ? REVIEW_PALETTE[category] : null;
           return {uci: candidate.uci, label: expected === null ? '' : `${expected.toFixed(1)}%`,
             metric: category ? `${category} · expected score` : 'Expected score', rank: index + 1,
-            color: multiArrowPage() ? visual?.color || TOP_MOVE_COLORS[index] : undefined,
+            color: multiArrowPage() ? visual?.color || TOP_MOVE_COLORS[index] || '#9ebcda' : undefined,
             icon: multiArrowPage() ? visual?.icon : undefined,
             category,
-            opacity: [1, 0.78, 0.62][index]};
+            opacity: Math.max(0.42, 1 - index * 0.07)};
         });
         movesEl.replaceChildren();
         for (const move of shownMoves) {
