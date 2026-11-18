@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stockfish 19 / Maia 3 Chess Board Assistant
 // @namespace    https://github.com/Jbsroboticsandautomationengineerstudent/Chess-study-training
-// @version      1.5.9
+// @version      1.6.0
 // @description  Switchable Stockfish 19 and Maia 3 board analysis
 // @match        https://www.chess.com/*
 // @match        https://chess.com/*
@@ -30,6 +30,8 @@
   const MAIA_MODEL_MIN_BYTES = 300_000_000;
   const ORT_DIST = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/';
   const RESEARCH_DEPTH = 18;
+  const STOCKFISH_NATIVE_MIN_ELO = 1320;
+  const STOCKFISH_MAX_ELO = 3190;
   const MAX_BOARD_ARROWS = 10;
   const STRONGEST_COLOR = '#00008A';
   const TOP_MOVE_COLORS = [STRONGEST_COLOR, '#3273b7', '#7fa7d1'];
@@ -46,7 +48,7 @@
     Brilliant: 'Unavailable: needs validated sacrifice analysis',
     Great: 'Best move; at least 150 cp ahead of the second choice, which is below -100 cp',
     Best: 'Evaluation loss up to 10 cp', Excellent: 'Evaluation loss up to 35 cp',
-    Good: 'Evaluation loss up to 80 cp', Book: 'Unavailable: needs an opening book',
+    Good: 'Evaluation loss up to 80 cp', Book: 'Curated first-move opening repertoire',
     Inaccuracy: 'Evaluation loss up to 160 cp', Mistake: 'Evaluation loss up to 300 cp',
     Miss: 'A winning +150 cp position falls to 0 or worse after a 160-300 cp loss',
     Blunder: 'Evaluation loss greater than 300 cp'
@@ -116,6 +118,9 @@
   let maiaRating = Math.max(600, Math.min(2600, Number(readSetting('maia-rating') ?? 2600) || 2600));
   let inferenceId = 0;
   let depth = Math.max(10, Math.min(25, Number(readSetting('stockfish-depth') ?? 11) || 11));
+  let stockfishElo = Math.max(600, Math.min(STOCKFISH_MAX_ELO,
+    Number(readSetting('stockfish-elo') ?? STOCKFISH_MAX_ELO) || STOCKFISH_MAX_ELO));
+  let stockfishAutoPlan = null;
   let autoPlay = readSetting('maia-autoplay') === 'true';
   let autoNextBot = readSetting('maia-auto-next-bot') === 'true';
   let autoPlayedFen = '';
@@ -211,6 +216,7 @@
     #maia-web-category-list .category-result{color:#c6d5e4;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     #maia-web-category-list .category-row[data-available="false"]{opacity:.7}
     #maia-web-arrow-note{font-size:11px;color:#aebfd0;margin:3px 0 8px}
+    #maia-web-stockfish-cycle{font-size:12px;color:#b9d8f5;margin:3px 0 7px}
     @media(max-width:600px){#maia-web-panel{top:68px;right:8px}}
   `;
   document.documentElement.appendChild(style);
@@ -222,7 +228,9 @@
     <div class="body">
       <div class="row"><button id="maia-web-human" title="Switch between Maia 3 and Stockfish 19">Enable human moves: OFF</button></div>
       <div class="row" id="maia-web-stockfish-settings"><label for="maia-web-depth">Depth</label><input id="maia-web-depth" type="range" min="10" max="25" value="11"><span id="maia-web-depth-label">11</span></div>
-      <div class="row" id="maia-web-stockfish-strength" title="Full single-threaded build; no strength handicap. Elo is not fixed by depth.">Full build · Max skill · Elo varies</div>
+      <div class="row" id="maia-web-stockfish-elo-row"><label for="maia-web-stockfish-elo">Target Elo</label><input id="maia-web-stockfish-elo" type="range" min="600" max="3190" step="10" value="3190"><span id="maia-web-stockfish-elo-label">3190</span></div>
+      <div class="row" id="maia-web-stockfish-strength" title="Stockfish 19 native UCI_Elo range is 1320–3190; lower settings are experimental.">Native 1320–3190 · below 1320 experimental</div>
+      <div id="maia-web-stockfish-cycle" hidden></div>
       <div class="row" id="maia-web-maia-settings" hidden><label for="maia-web-rating">Maia rating</label><input id="maia-web-rating" type="range" min="600" max="2600" step="100" value="2600"><span id="maia-web-rating-label">2600</span></div>
       <div class="row" id="maia-web-maia-note" hidden>Maia 79M · one prediction pass; no search depth</div>
       <div class="row" id="maia-web-auto-row"><button id="maia-web-autoplay">Auto-play: OFF</button>
@@ -261,6 +269,9 @@
   const statusEl = panel.querySelector('#maia-web-status');
   const depthEl = panel.querySelector('#maia-web-depth');
   const depthLabelEl = panel.querySelector('#maia-web-depth-label');
+  const stockfishEloEl = panel.querySelector('#maia-web-stockfish-elo');
+  const stockfishEloLabelEl = panel.querySelector('#maia-web-stockfish-elo-label');
+  const stockfishCycleEl = panel.querySelector('#maia-web-stockfish-cycle');
   const humanButton = panel.querySelector('#maia-web-human');
   const ratingEl = panel.querySelector('#maia-web-rating');
   const ratingLabelEl = panel.querySelector('#maia-web-rating-label');
@@ -318,6 +329,8 @@
     categoryListSignature = '';
     arrowNoteEl.hidden = true;
     shownMoves = [];
+    stockfishAutoPlan = null;
+    stockfishCycleEl.textContent = '';
     shownValue = null;
     valueLabels.forEach((label, index) => { label.textContent = `${['White win', 'Draw', 'Black win'][index]} —`; });
     valueSegments.forEach(segment => { segment.style.width = '0%'; });
@@ -651,7 +664,8 @@
       result.textContent = match ? `${match.uci} · ${match.label}` :
         !game ? 'Waiting for board' :
         category === 'Brilliant' ? 'Sacrifice analysis unavailable' :
-        category === 'Book' ? 'Opening book unavailable' :
+        category === 'Book' ? engineMode === 'maia' ? 'Opening book unavailable' :
+          'No curated book move here' :
         maiaResult && !maiaResult.complete ? 'Checking remaining moves…' :
         category === 'Blunder' && maiaResult?.complete && maiaResult.moves.length
           ? `Max loss ${(100 * (maiaResult.moves[0].expected -
@@ -778,10 +792,17 @@
       return;
     }
   }
+  function currentAutoMove() {
+    return engineMode === 'stockfish'
+      ? stockfishAutoPlan?.fen === game?.fen() ? stockfishAutoPlan.uci : null
+      : shownMoves[0]?.uci;
+  }
   function maybeAutoPlay(fen, uci) {
     if (!autoPlay || !autoPlayablePage() || researchJob || game?.game_over?.() ||
         activeSearch || pendingSearch || !board ||
-        game?.turn() !== autoSide() || autoPlayedFen === fen) return;
+        game?.turn() !== autoSide() || autoPlayedFen === fen || currentAutoMove() !== uci ||
+        !game.moves({verbose: true}).some(move =>
+          `${move.from}${move.to}${move.promotion || ''}` === uci)) return;
     autoPlayedFen = fen; // One attempt per position, even if the site ignores synthetic events.
     const delay = botThinkingDelay();
     const token = ++autoPlayToken;
@@ -791,7 +812,7 @@
       autoPlayTimer = 0;
       if (token !== autoPlayToken || !autoPlay || !autoPlayablePage() ||
           researchJob || game?.game_over?.() || game?.fen() !== fen ||
-          shownMoves[0]?.uci !== uci || !board?.isConnected) return;
+          currentAutoMove() !== uci || !board?.isConnected) return;
       const moved = clickBoardSquare(uci.slice(0, 2)) && clickBoardSquare(uci.slice(2, 4));
       if (!moved) { setStatus('Auto-play could not reach the board. Move manually.'); return; }
       if (uci.length === 5) setTimeout(() => choosePromotion(uci), 50);
@@ -1452,6 +1473,82 @@
     else category = 'Mistake';
     return {category, lossCp, accuracy: 100 * Math.exp(-lossCp / 150)};
   }
+  function openingBookCandidates(position = game) {
+    if (!position || Number(position.fen().split(' ')[5]) !== 1) return [];
+    const legal = new Set(position.moves({verbose: true}).map(move =>
+      `${move.from}${move.to}${move.promotion || ''}`));
+    let repertoire;
+    if (position.turn() === 'w') repertoire = ['e2e4', 'd2d4', 'c2c4', 'g1f3'];
+    else if (position.get('e4')?.color === 'w') repertoire = ['e7e5', 'c7c5', 'e7e6', 'c7c6'];
+    else if (position.get('d4')?.color === 'w') repertoire = ['d7d5', 'g8f6', 'e7e6'];
+    else if (position.get('c4')?.color === 'w') repertoire = ['e7e5', 'g8f6', 'c7c5'];
+    else repertoire = ['g8f6', 'd7d5', 'e7e6'];
+    return repertoire.filter(move => legal.has(move));
+  }
+  function weightedChoice(items, weightOf) {
+    const total = items.reduce((sum, item) => sum + weightOf(item), 0);
+    let ticket = Math.random() * total;
+    for (const item of items) {
+      ticket -= weightOf(item);
+      if (ticket < 0) return item;
+    }
+    return items[items.length - 1];
+  }
+  function chooseStockfishAutoMove(fen, limitedBest, strongest, rootLines = new Map()) {
+    const fullMove = Math.max(1, Number(fen.split(' ')[5]) || 1);
+    const slot = (fullMove - 1) % 6 + 1;
+    const legal = new Set(game.moves({verbose: true}).map(move =>
+      `${move.from}${move.to}${move.promotion || ''}`));
+    const fallback = legal.has(limitedBest) ? limitedBest : strongest;
+    if (slot === 1) {
+      const book = openingBookCandidates(game);
+      if (book.length) return {fen, slot, uci: book[Math.floor(Math.random() * book.length)], kind: 'Book'};
+      return {fen, slot, uci: strongest, kind: 'Best (no opening book at this move)'};
+    }
+    const position = liveCategoryByFen.get(fen);
+    if (!position?.complete || position.moves.length !== position.legalCount ||
+        !position.moves.every(move => Number.isFinite(move.cp))) {
+      if (slot >= 4) {
+        const ranked = [...rootLines.entries()].sort((a, b) => a[0] - b[0])
+          .map(([, move]) => move.uci).filter(move => legal.has(move) && move !== strongest);
+        const weak = ranked.slice(-Math.max(1, Math.ceil(ranked.length / 4)));
+        const alternatives = weak.length ? weak : [...legal].filter(move => move !== strongest);
+        if (alternatives.length) return {fen, slot,
+          uci: alternatives[Math.floor(Math.random() * alternatives.length)],
+          kind: weak.length ? 'Low-ranked (score incomplete)' : 'Random legal (score incomplete)'};
+      }
+      return {fen, slot, uci: fallback, kind: 'Native choice (full scores unavailable)'};
+    }
+    const moves = position.moves.filter(move => legal.has(move.uci));
+    if (!moves.length) return {fen, slot, uci: fallback, kind: 'Native choice'};
+    const bestCp = moves[0].cp, secondCp = moves[1]?.cp;
+    const graded = moves.map((move, index) => ({...move, category: qualityFromLoss(
+      Math.max(0, bestCp - move.cp), bestCp, move.cp, index === 0, secondCp).category}));
+    if (slot <= 3) {
+      const good = graded.filter(move => ['Best', 'Great', 'Excellent', 'Good'].includes(move.category));
+      if (!good.length) return {fen, slot, uci: strongest, kind: 'Best'};
+      const strength = (stockfishElo - 600) / (STOCKFISH_MAX_ELO - 600);
+      const chosen = weightedChoice(good, move => {
+        const categoryWeight = move.category === 'Best' || move.category === 'Great'
+          ? 1 + 3 * strength : move.category === 'Good' ? 1 + 3 * (1 - strength) : 2;
+        return categoryWeight * (move.uci === limitedBest ? 1.5 : 1);
+      });
+      return {fen, slot, uci: chosen.uci, kind: chosen.category};
+    }
+    const worst = graded.slice(-Math.max(1, Math.ceil(graded.length / 4)));
+    const bad = graded.filter(move => move.category === 'Blunder' || move.category === 'Miss');
+    const options = new Map();
+    for (const move of worst) options.set(move.uci, {...move, kind: 'Low-ranked'});
+    for (const move of bad) options.set(move.uci, {...move, kind: move.category});
+    const chosen = [...options.values()][Math.floor(Math.random() * options.size)];
+    return {fen, slot, uci: chosen?.uci || fallback, kind: chosen?.kind || 'Native choice'};
+  }
+  function showStockfishAutoPlan(plan) {
+    stockfishAutoPlan = plan;
+    stockfishCycleEl.textContent = plan
+      ? `Auto cycle ${plan.slot}/6 · ${plan.kind} · ${plan.uci}` : '';
+    stockfishCycleEl.hidden = engineMode !== 'stockfish' || !autoPlay || !plan;
+  }
   function classifyReviewedMove(result) {
     if (!result.complete || !result.moves?.length) return null;
     const best = result.moves[0];
@@ -1512,6 +1609,13 @@
       representatives.set(quality.category, {uci: candidate.uci,
         label: engineScoreLabel({cp: candidate.cp}), metric: `${quality.category} · centipawn evaluation`,
         color: visual.color, icon: visual.icon, category: quality.category});
+    }
+    const book = new Set(openingBookCandidates(game));
+    const bookMove = position.moves.find(move => book.has(move.uci));
+    if (bookMove) {
+      const visual = REVIEW_PALETTE.Book;
+      representatives.set('Book', {uci: bookMove.uci, label: engineScoreLabel({cp: bookMove.cp}),
+        metric: 'Curated opening move', color: visual.color, icon: visual.icon, category: 'Book'});
     }
     return CATEGORY_ORDER.filter(name => representatives.has(name)).map(name => representatives.get(name));
   }
@@ -1643,6 +1747,8 @@
     const position = researchJob.positions[researchJob.index];
     researchJob.active = {position, scores: new Map()};
     researchNoteEl.textContent = `Fixed depth ${RESEARCH_DEPTH}: position ${researchJob.index + 1}/${researchJob.positions.length}, ${position.legal.length} legal moves…`;
+    worker.postMessage('setoption name UCI_LimitStrength value false');
+    worker.postMessage('setoption name Skill Level value 20');
     worker.postMessage(`setoption name MultiPV value ${position.legal.length}`);
     worker.postMessage(`position fen ${position.fen}`);
     worker.postMessage(`go depth ${RESEARCH_DEPTH}`);
@@ -1727,6 +1833,11 @@
     scan();
   }
 
+  function configureStockfishStrength() {
+    if (!worker) return;
+    worker.postMessage('setoption name UCI_LimitStrength value true');
+    worker.postMessage(`setoption name UCI_Elo value ${Math.max(STOCKFISH_NATIVE_MIN_ELO, stockfishElo)}`);
+  }
   function beginSearch() {
     if (engineMode !== 'stockfish' || !engineReady || activeSearch || !pendingSearch || !worker || researchJob) return;
     activeSearch = {...pendingSearch, stale: false, evaluation: null, reachedDepth: 0,
@@ -1734,6 +1845,7 @@
       multipv: multiArrowPage() ? game.moves().length : 1,
       legal: new Set(game.moves({verbose: true}).map(move => `${move.from}${move.to}${move.promotion || ''}`))};
     pendingSearch = null;
+    configureStockfishStrength();
     worker.postMessage(`setoption name MultiPV value ${activeSearch.multipv}`);
     worker.postMessage(`position fen ${activeSearch.fen}`);
     worker.postMessage(`go depth ${activeSearch.depth}`);
@@ -1741,6 +1853,10 @@
   }
   function requestAnalysis(fen) {
     if (engineMode !== 'stockfish' || !engineReady || !game || researchJob || fen === lastFen) return;
+    clearTimeout(autoPlayTimer);
+    autoPlayToken++;
+    showStockfishAutoPlan(null);
+    liveCategoryByFen.delete(fen);
     if (!game.moves().length) {
       lastFen = fen;
       setStatus('No legal moves in this position.');
@@ -1777,8 +1893,8 @@
     if (line === 'uciok') {
       worker.postMessage('setoption name Hash value 32');
       worker.postMessage('setoption name MultiPV value 1');
-      worker.postMessage('setoption name UCI_LimitStrength value false');
       worker.postMessage('setoption name Skill Level value 20');
+      configureStockfishStrength();
       worker.postMessage('setoption name UCI_ShowWDL value true');
       worker.postMessage('isready');
       return;
@@ -1823,18 +1939,21 @@
     const finished = activeSearch;
     activeSearch = null;
     if (!finished.stale && !pendingSearch && game?.fen() === finished.fen) {
-      const best = /^bestmove ([a-h][1-8][a-h][1-8][qrbn]?)/.exec(line)?.[1];
+      const limitedBest = /^bestmove ([a-h][1-8][a-h][1-8][qrbn]?)/.exec(line)?.[1];
+      const rootBest = finished.lines.get(1);
+      const best = rootBest?.uci || limitedBest;
+      const bestEvaluation = rootBest?.evaluation || finished.evaluation;
       const legal = game.moves({verbose: true}).some(move =>
         `${move.from}${move.to}${move.promotion || ''}` === best);
       if (best && legal) {
-        const candidates = [{uci: best, rank: 1, evaluation: finished.evaluation}];
+        const candidates = [{uci: best, rank: 1, evaluation: bestEvaluation}];
         if (multiArrowPage()) for (let rank = 2; rank <= Math.min(MAX_BOARD_ARROWS, finished.multipv); rank++) {
           const alternative = finished.lines.get(rank);
           if (alternative?.depth < finished.reachedDepth || !alternative ||
               candidates.some(move => move.uci === alternative.uci)) continue;
           candidates.push({...alternative, rank});
         }
-        const bestCp = finished.evaluation?.cp;
+        const bestCp = bestEvaluation?.cp;
         shownMoves = candidates.map((candidate, index) => {
           const loss = Number.isFinite(bestCp) && Number.isFinite(candidate.evaluation?.cp)
             ? Math.max(0, bestCp - candidate.evaluation.cp) : null;
@@ -1855,11 +1974,11 @@
           if (move.color) item.style.color = move.color;
           movesEl.appendChild(item);
         }
-        showValue(finished.evaluation, game.turn() === 'b');
-        if (botGamePage() && Number.isFinite(finished.evaluation?.cp)) {
+        showValue(bestEvaluation, game.turn() === 'b');
+        if (botGamePage() && Number.isFinite(bestEvaluation?.cp)) {
           if (livePending?.postFen === finished.fen && livePending.side !== game.turn()) {
             const lossCp = livePending.played === livePending.best ? 0 :
-              Math.max(0, livePending.bestCp + finished.evaluation.cp);
+              Math.max(0, livePending.bestCp + bestEvaluation.cp);
             const playedCp = livePending.bestCp - lossCp;
             liveReview.push({fen: livePending.fen, postFen: finished.fen,
               side: livePending.side, played: livePending.played,
@@ -1868,12 +1987,14 @@
                 finished.reachedDepth || finished.depth)}});
             livePending = null;
           }
-          lastSearchResult = {fen: finished.fen, cp: finished.evaluation.cp, best,
+          lastSearchResult = {fen: finished.fen, cp: bestEvaluation.cp, best,
             depth: finished.reachedDepth || finished.depth};
           renderReview();
         }
+        const plan = chooseStockfishAutoMove(finished.fen, limitedBest, best, finished.lines);
+        showStockfishAutoPlan(plan);
         drawArrows();
-        maybeAutoPlay(finished.fen, best);
+        maybeAutoPlay(finished.fen, plan.uci);
         setStatus(`Stockfish 19 · depth ${finished.reachedDepth || finished.depth} · ${game.turn() === 'b' ? 'Black' : 'White'} to move`);
       } else {
         clearPrediction();
@@ -2090,7 +2211,8 @@
     const state = {type: 'state', status: statusEl.textContent, opening: openingName,
       fen: game?.fen() || '', blackView: board ? isBlackView() : lastBoardOrientation,
       skin: captureBoardSkin(),
-      engineMode, depth, maiaRating, autoPlay, autoNextBot, study: studyReviewPage(),
+      engineMode, depth, stockfishElo, stockfishCycle: stockfishAutoPlan?.fen === game?.fen()
+        ? stockfishAutoPlan : null, maiaRating, autoPlay, autoNextBot, study: studyReviewPage(),
       moves: top ? [{uci: top.uci,
         label: engineMode === 'maia' ? `p ${top.label}` : top.label,
         metric: engineMode === 'maia' ? 'Move probability' : top.metric,
@@ -2151,7 +2273,7 @@
         #mini-board .black-piece{color:#182018;text-shadow:0 1px 1px #fff9}
         #mini-arrow{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible}
         </style></head><body><main><h1>${studyReviewPage() ? 'Board Studio' : engineMode === 'maia' ? 'Maia 79M' : 'Stockfish 19'}</h1><div id="status">Connecting…</div>
-        <div id="depth">Depth: 11</div><div id="opening">Opening: —</div><div id="review" hidden></div><div id="mini-board" aria-label="Current chess position"><svg id="mini-arrow" viewBox="0 0 100 100" aria-hidden="true"></svg></div>
+        <div id="depth">Depth: 11</div><div id="stockfish-elo"></div><div id="cycle"></div><div id="opening">Opening: —</div><div id="review" hidden></div><div id="mini-board" aria-label="Current chess position"><svg id="mini-arrow" viewBox="0 0 100 100" aria-hidden="true"></svg></div>
         <ol id="moves"></ol><div id="labels"><span>White win —</span><span>Draw —</span><span>Black win —</span></div>
         <div id="bar"><span id="white"></span><span id="draw"></span><span id="black"></span></div>
         <div class="row"><button id="human">${studyReviewPage() ? 'Human style' : 'Enable human moves'}: ${engineMode === 'maia' ? 'ON' : 'OFF'}</button></div>
@@ -2187,6 +2309,10 @@
         popup.document.getElementById('status').textContent = state.status;
         popup.document.getElementById('depth').textContent = state.engineMode === 'maia'
           ? `${state.study ? 'Human rating' : 'Maia rating'}: ${state.maiaRating} · single pass` : `Depth: ${state.depth}`;
+        popup.document.getElementById('stockfish-elo').textContent = state.engineMode === 'stockfish'
+          ? `Stockfish target Elo: ${state.stockfishElo}${state.stockfishElo < STOCKFISH_NATIVE_MIN_ELO ? ' (experimental)' : ''}` : '';
+        popup.document.getElementById('cycle').textContent = state.engineMode === 'stockfish' && state.autoPlay && state.stockfishCycle
+          ? `Auto cycle ${state.stockfishCycle.slot}/6 · ${state.stockfishCycle.kind} · ${state.stockfishCycle.uci}` : '';
         popup.document.getElementById('opening').textContent = `Opening: ${state.opening || '—'}`;
         const reviewLine = popup.document.getElementById('review');
         reviewLine.hidden = !state.review;
@@ -2253,14 +2379,17 @@
     panel.querySelector('#maia-web-head span').textContent = study ? 'Board Studio' :
       maia ? 'Maia 79M · Human moves' : 'Stockfish 19';
     panel.querySelector('#maia-web-stockfish-settings').hidden = maia;
+    panel.querySelector('#maia-web-stockfish-elo-row').hidden = maia;
     panel.querySelector('#maia-web-stockfish-strength').hidden = maia;
+    stockfishCycleEl.hidden = maia || !autoPlay || !stockfishAutoPlan;
     panel.querySelector('#maia-web-maia-settings').hidden = !maia;
     panel.querySelector('#maia-web-maia-note').hidden = !maia;
     panel.querySelector('#maia-web-maia-settings label').textContent = study ? 'Human rating' : 'Maia rating';
     panel.querySelector('#maia-web-maia-note').textContent = study ?
       'Probability model · one pass; no search depth' : 'Maia 79M · one prediction pass; no search depth';
-    panel.querySelector('#maia-web-stockfish-strength').textContent = study ?
-      'Maximum search · Elo varies' : 'Full build · Max skill · Elo varies';
+    panel.querySelector('#maia-web-stockfish-strength').textContent = stockfishElo < STOCKFISH_NATIVE_MIN_ELO
+      ? `Below native ${STOCKFISH_NATIVE_MIN_ELO}: experimental cycle strength; no calibrated ${stockfishElo} Elo`
+      : `Native UCI_Elo ${stockfishElo} · six-move cycle overrides some choices`;
     panel.querySelector('#maia-web-retry').textContent = maia ? (study ? 'Load model' : 'Load Maia') : 'Retry analysis';
     publishStreamState();
   }
@@ -2315,7 +2444,7 @@
     autoPlayToken++;
     autoPlayedFen = '';
     maybeStartNextBotGame();
-    if (autoPlay && game && shownMoves[0]) maybeAutoPlay(game.fen(), shownMoves[0].uci);
+    if (autoPlay && game && currentAutoMove()) maybeAutoPlay(game.fen(), currentAutoMove());
   });
   nextButton.addEventListener('click', () => {
     autoNextBot = !autoNextBot;
@@ -2330,7 +2459,7 @@
     autoPlayedFen = '';
     drawArrows();
     publishStreamState();
-    if (autoPlay && game && shownMoves[0]) maybeAutoPlay(game.fen(), shownMoves[0].uci);
+    if (autoPlay && game && currentAutoMove()) maybeAutoPlay(game.fen(), currentAutoMove());
   });
   panel.querySelector('#maia-web-research-run').addEventListener('click', startPostgameResearch);
   panel.querySelector('#maia-web-research-cancel').addEventListener('click', () => {
@@ -2360,6 +2489,24 @@
     }
     publishStreamState();
   });
+  stockfishEloEl.addEventListener('input', () => {
+    stockfishEloLabelEl.textContent = String(stockfishEloEl.value);
+  });
+  stockfishEloEl.addEventListener('change', () => {
+    stockfishElo = Math.max(600, Math.min(STOCKFISH_MAX_ELO,
+      Number(stockfishEloEl.value) || STOCKFISH_MAX_ELO));
+    saveSetting('stockfish-elo', stockfishElo);
+    stockfishEloLabelEl.textContent = String(stockfishElo);
+    clearTimeout(autoPlayTimer);
+    autoPlayToken++;
+    autoPlayedFen = '';
+    showStockfishAutoPlan(null);
+    syncEngineUi();
+    if (engineMode === 'stockfish') {
+      lastFen = '';
+      if (game) requestAnalysis(game.fen());
+    }
+  });
   panel.querySelector('#maia-web-rescan').addEventListener('click', () => {
     game = null; lastBoard = ''; clearPrediction(); scan();
   });
@@ -2368,7 +2515,7 @@
     saveSetting('flip', flipOverride);
     drawArrows();
     autoPlayedFen = '';
-    if (autoPlay && game && shownMoves[0]) maybeAutoPlay(game.fen(), shownMoves[0].uci);
+    if (autoPlay && game && currentAutoMove()) maybeAutoPlay(game.fen(), currentAutoMove());
   });
   panel.querySelector('#maia-web-streamer').addEventListener('click', () => {
     if (streamerMode) stopStreamerMode();
@@ -2416,6 +2563,8 @@
   setInterval(scan, 300);
   depthEl.value = String(depth);
   depthLabelEl.textContent = String(depth);
+  stockfishEloEl.value = String(stockfishElo);
+  stockfishEloLabelEl.textContent = String(stockfishElo);
   ratingEl.value = String(maiaRating);
   ratingLabelEl.textContent = String(maiaRating);
   const savedAutoSide = readSetting('maia-auto-side');
