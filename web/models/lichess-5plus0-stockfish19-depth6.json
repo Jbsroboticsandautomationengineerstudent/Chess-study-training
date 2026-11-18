@@ -1,0 +1,85 @@
+{
+  "schemaVersion": 1,
+  "source": "Lichess/standard-chess-games",
+  "parquet": "lichess-2024-01-shard0.parquet",
+  "timeControl": "300+0",
+  "engine": "Stockfish 19",
+  "depth": 6,
+  "selection": "one position per player-game, plies 8\u201360; held-out players by hashed username",
+  "model": "P(move) proportional to exp(-betaPerPawn * min(8, centipawnLoss / 100))",
+  "ratingSystem": "Lichess Glicko-2; not Chess.com Elo",
+  "bands": [
+    {
+      "minRating": 600,
+      "maxRating": 699,
+      "betaPerPawn": 0.447964,
+      "trainPositions": 222,
+      "holdoutPositions": 69,
+      "holdoutNll": 2.78708,
+      "uniformNll": 3.126976
+    },
+    {
+      "minRating": 700,
+      "maxRating": 799,
+      "betaPerPawn": 0.52127,
+      "trainPositions": 244,
+      "holdoutPositions": 42,
+      "holdoutNll": 2.732022,
+      "uniformNll": 3.351241
+    },
+    {
+      "minRating": 800,
+      "maxRating": 899,
+      "betaPerPawn": 0.62304,
+      "trainPositions": 239,
+      "holdoutPositions": 56,
+      "holdoutNll": 2.301351,
+      "uniformNll": 3.294881
+    },
+    {
+      "minRating": 900,
+      "maxRating": 999,
+      "betaPerPawn": 0.596721,
+      "trainPositions": 227,
+      "holdoutPositions": 69,
+      "holdoutNll": 2.188028,
+      "uniformNll": 3.36174
+    },
+    {
+      "minRating": 1000,
+      "maxRating": 1099,
+      "betaPerPawn": 0.598167,
+      "trainPositions": 230,
+      "holdoutPositions": 60,
+      "holdoutNll": 2.600713,
+      "uniformNll": 3.345588
+    },
+    {
+      "minRating": 1100,
+      "maxRating": 1199,
+      "betaPerPawn": 0.69854,
+      "trainPositions": 218,
+      "holdoutPositions": 75,
+      "holdoutNll": 2.614901,
+      "uniformNll": 3.193011
+    },
+    {
+      "minRating": 1200,
+      "maxRating": 1299,
+      "betaPerPawn": 0.650618,
+      "trainPositions": 230,
+      "holdoutPositions": 69,
+      "holdoutNll": 2.554551,
+      "uniformNll": 3.414023
+    },
+    {
+      "minRating": 1300,
+      "maxRating": 1320,
+      "betaPerPawn": 0.781472,
+      "trainPositions": 232,
+      "holdoutPositions": 62,
+      "holdoutNll": 2.643766,
+      "uniformNll": 3.506935
+    }
+  ]
+}

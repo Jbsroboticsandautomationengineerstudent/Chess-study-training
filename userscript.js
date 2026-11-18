@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stockfish 19 / Maia 3 Chess Board Assistant
 // @namespace    https://github.com/Jbsroboticsandautomationengineerstudent/Chess-study-training
-// @version      1.6.0
+// @version      1.7.0
 // @description  Switchable Stockfish 19 and Maia 3 board analysis
 // @match        https://www.chess.com/*
 // @match        https://chess.com/*
@@ -32,6 +32,11 @@
   const RESEARCH_DEPTH = 18;
   const STOCKFISH_NATIVE_MIN_ELO = 1320;
   const STOCKFISH_MAX_ELO = 3190;
+  // Fitted from one January 2024 Lichess 5+0 shard; see web/models and tools/.
+  // These are Lichess rating-conditioned choices, not Chess.com Elo estimates.
+  const LICHESS_FIT_DEPTH = 6;
+  const LICHESS_BETA = [0.447964, 0.521270, 0.623040, 0.596721,
+    0.598167, 0.698540, 0.650618, 0.781472];
   const MAX_BOARD_ARROWS = 10;
   const STRONGEST_COLOR = '#00008A';
   const TOP_MOVE_COLORS = [STRONGEST_COLOR, '#3273b7', '#7fa7d1'];
@@ -229,7 +234,7 @@
       <div class="row"><button id="maia-web-human" title="Switch between Maia 3 and Stockfish 19">Enable human moves: OFF</button></div>
       <div class="row" id="maia-web-stockfish-settings"><label for="maia-web-depth">Depth</label><input id="maia-web-depth" type="range" min="10" max="25" value="11"><span id="maia-web-depth-label">11</span></div>
       <div class="row" id="maia-web-stockfish-elo-row"><label for="maia-web-stockfish-elo">Target Elo</label><input id="maia-web-stockfish-elo" type="range" min="600" max="3190" step="10" value="3190"><span id="maia-web-stockfish-elo-label">3190</span></div>
-      <div class="row" id="maia-web-stockfish-strength" title="Stockfish 19 native UCI_Elo range is 1320–3190; lower settings are experimental.">Native 1320–3190 · below 1320 experimental</div>
+      <div class="row" id="maia-web-stockfish-strength" title="Below 1320 uses an experimental Lichess 5+0 move-choice fit at fixed depth 6.">Native 1320–3190 · below 1320 Lichess 5+0 sample</div>
       <div id="maia-web-stockfish-cycle" hidden></div>
       <div class="row" id="maia-web-maia-settings" hidden><label for="maia-web-rating">Maia rating</label><input id="maia-web-rating" type="range" min="600" max="2600" step="100" value="2600"><span id="maia-web-rating-label">2600</span></div>
       <div class="row" id="maia-web-maia-note" hidden>Maia 79M · one prediction pass; no search depth</div>
@@ -609,6 +614,13 @@
   }
   function displayArrowMoves(moves = shownMoves) {
     const categories = categoryArrowsForBoard();
+    const plan = engineMode === 'stockfish' && stockfishElo < STOCKFISH_NATIVE_MIN_ELO &&
+      stockfishAutoPlan?.fen === game?.fen() && stockfishAutoPlan.category
+      ? stockfishAutoPlan : null;
+    const selected = plan ? {uci: plan.uci, label: engineScoreLabel({cp: plan.cp}),
+      metric: 'Lichess sample choice', category: plan.category,
+      color: REVIEW_PALETTE[plan.category].color,
+      icon: REVIEW_PALETTE[plan.category].icon, opacity: 1} : null;
     const maiaGrades = engineMode === 'maia'
       ? new Map((maiaValueCache.get(maiaValueKey(game?.fen() || ''))?.moves || [])
         .map(move => [move.uci, move])) : null;
@@ -620,7 +632,7 @@
         label: `M ${(100 * grade.expected).toFixed(1)}%`, metric: 'Maia expected score'};
     });
     const display = [];
-    for (const move of [...categories, ...suggestions]) {
+    for (const move of [...(selected ? [selected] : []), ...categories, ...suggestions]) {
       if (display.length >= MAX_BOARD_ARROWS) break;
       if (!display.some(existing => existing.uci === move.uci)) display.push(move);
     }
@@ -713,6 +725,9 @@
       : engineMode === 'maia'
         ? 'Blue: strongest Maia policy move (p = probability); checking value categories.'
         : 'Blue: strongest search move. cp = side-to-move score; checking other moves.';
+    if (engineMode === 'stockfish' && stockfishElo < STOCKFISH_NATIVE_MIN_ELO &&
+        stockfishAutoPlan?.fen === game.fen() && stockfishAutoPlan.category)
+      arrowNoteEl.textContent = 'Blue: strongest search move. Colored choice: Lichess 5+0 sample; label is Stockfish score in cp.';
     if (!paintMoves.length && !strongest) {
       arrow.style.display = 'none';
       return;
@@ -1494,12 +1509,36 @@
     }
     return items[items.length - 1];
   }
+  function lichessBeta(rating) {
+    const position = Math.max(0, Math.min(LICHESS_BETA.length - 1, (rating - 600) / 100));
+    const lower = Math.floor(position);
+    const upper = Math.min(LICHESS_BETA.length - 1, lower + 1);
+    return LICHESS_BETA[lower] * (1 - (position - lower)) +
+      LICHESS_BETA[upper] * (position - lower);
+  }
   function chooseStockfishAutoMove(fen, limitedBest, strongest, rootLines = new Map()) {
     const fullMove = Math.max(1, Number(fen.split(' ')[5]) || 1);
     const slot = (fullMove - 1) % 6 + 1;
     const legal = new Set(game.moves({verbose: true}).map(move =>
       `${move.from}${move.to}${move.promotion || ''}`));
     const fallback = legal.has(limitedBest) ? limitedBest : strongest;
+    if (stockfishElo < STOCKFISH_NATIVE_MIN_ELO) {
+      const scored = [...rootLines.values()].filter(move => legal.has(move.uci) &&
+        move.depth >= LICHESS_FIT_DEPTH && Number.isFinite(move.evaluation?.cp));
+      if (scored.length !== legal.size ||
+          new Set(scored.map(move => move.uci)).size !== legal.size)
+        return {fen, slot: null, uci: strongest, kind: 'Full scores unavailable; strongest move'};
+      const bestCp = Math.max(...scored.map(move => move.evaluation.cp));
+      const beta = lichessBeta(stockfishElo);
+      const selected = weightedChoice(scored, move => Math.exp(-beta *
+        Math.min(8, Math.max(0, bestCp - move.evaluation.cp) / 100)));
+      const lossCp = Math.max(0, bestCp - selected.evaluation.cp);
+      const category = qualityFromLoss(lossCp, bestCp, selected.evaluation.cp,
+        lossCp === 0, scored.length > 1 ?
+          [...scored].sort((a, b) => b.evaluation.cp - a.evaluation.cp)[1].evaluation.cp : undefined).category;
+      return {fen, slot: null, uci: selected.uci, cp: selected.evaluation.cp,
+        category, kind: `Lichess 5+0 sample · rating ${stockfishElo}`};
+    }
     if (slot === 1) {
       const book = openingBookCandidates(game);
       if (book.length) return {fen, slot, uci: book[Math.floor(Math.random() * book.length)], kind: 'Book'};
@@ -1546,8 +1585,10 @@
   function showStockfishAutoPlan(plan) {
     stockfishAutoPlan = plan;
     stockfishCycleEl.textContent = plan
-      ? `Auto cycle ${plan.slot}/6 · ${plan.kind} · ${plan.uci}` : '';
-    stockfishCycleEl.hidden = engineMode !== 'stockfish' || !autoPlay || !plan;
+      ? plan.slot === null ? `${plan.kind} · ${plan.uci}` :
+        `Auto cycle ${plan.slot}/6 · ${plan.kind} · ${plan.uci}` : '';
+    stockfishCycleEl.hidden = engineMode !== 'stockfish' || !plan ||
+      (plan.slot !== null && !autoPlay);
   }
   function classifyReviewedMove(result) {
     if (!result.complete || !result.moves?.length) return null;
@@ -1835,12 +1876,15 @@
 
   function configureStockfishStrength() {
     if (!worker) return;
-    worker.postMessage('setoption name UCI_LimitStrength value true');
-    worker.postMessage(`setoption name UCI_Elo value ${Math.max(STOCKFISH_NATIVE_MIN_ELO, stockfishElo)}`);
+    const nativeRating = stockfishElo >= STOCKFISH_NATIVE_MIN_ELO;
+    worker.postMessage(`setoption name UCI_LimitStrength value ${nativeRating}`);
+    if (nativeRating) worker.postMessage(`setoption name UCI_Elo value ${stockfishElo}`);
   }
   function beginSearch() {
     if (engineMode !== 'stockfish' || !engineReady || activeSearch || !pendingSearch || !worker || researchJob) return;
-    activeSearch = {...pendingSearch, stale: false, evaluation: null, reachedDepth: 0,
+    activeSearch = {...pendingSearch,
+      depth: stockfishElo < STOCKFISH_NATIVE_MIN_ELO ? LICHESS_FIT_DEPTH : pendingSearch.depth,
+      stale: false, evaluation: null, reachedDepth: 0,
       lines: new Map(), categoryDepth: 0,
       multipv: multiArrowPage() ? game.moves().length : 1,
       legal: new Set(game.moves({verbose: true}).map(move => `${move.from}${move.to}${move.promotion || ''}`))};
@@ -2211,7 +2255,8 @@
     const state = {type: 'state', status: statusEl.textContent, opening: openingName,
       fen: game?.fen() || '', blackView: board ? isBlackView() : lastBoardOrientation,
       skin: captureBoardSkin(),
-      engineMode, depth, stockfishElo, stockfishCycle: stockfishAutoPlan?.fen === game?.fen()
+      engineMode, depth: stockfishElo < STOCKFISH_NATIVE_MIN_ELO ? LICHESS_FIT_DEPTH : depth,
+      stockfishElo, stockfishCycle: stockfishAutoPlan?.fen === game?.fen()
         ? stockfishAutoPlan : null, maiaRating, autoPlay, autoNextBot, study: studyReviewPage(),
       moves: top ? [{uci: top.uci,
         label: engineMode === 'maia' ? `p ${top.label}` : top.label,
@@ -2310,9 +2355,14 @@
         popup.document.getElementById('depth').textContent = state.engineMode === 'maia'
           ? `${state.study ? 'Human rating' : 'Maia rating'}: ${state.maiaRating} · single pass` : `Depth: ${state.depth}`;
         popup.document.getElementById('stockfish-elo').textContent = state.engineMode === 'stockfish'
-          ? `Stockfish target Elo: ${state.stockfishElo}${state.stockfishElo < STOCKFISH_NATIVE_MIN_ELO ? ' (experimental)' : ''}` : '';
-        popup.document.getElementById('cycle').textContent = state.engineMode === 'stockfish' && state.autoPlay && state.stockfishCycle
-          ? `Auto cycle ${state.stockfishCycle.slot}/6 · ${state.stockfishCycle.kind} · ${state.stockfishCycle.uci}` : '';
+          ? state.stockfishElo < STOCKFISH_NATIVE_MIN_ELO
+            ? `Lichess 5+0 sample rating: ${state.stockfishElo} · experimental`
+            : `Stockfish target Elo: ${state.stockfishElo}` : '';
+        popup.document.getElementById('cycle').textContent = state.engineMode === 'stockfish' && state.stockfishCycle &&
+          (state.autoPlay || state.stockfishCycle.slot === null)
+          ? state.stockfishCycle.slot === null
+            ? `${state.stockfishCycle.kind} · ${state.stockfishCycle.uci}`
+            : `Auto cycle ${state.stockfishCycle.slot}/6 · ${state.stockfishCycle.kind} · ${state.stockfishCycle.uci}` : '';
         popup.document.getElementById('opening').textContent = `Opening: ${state.opening || '—'}`;
         const reviewLine = popup.document.getElementById('review');
         reviewLine.hidden = !state.review;
@@ -2381,14 +2431,22 @@
     panel.querySelector('#maia-web-stockfish-settings').hidden = maia;
     panel.querySelector('#maia-web-stockfish-elo-row').hidden = maia;
     panel.querySelector('#maia-web-stockfish-strength').hidden = maia;
-    stockfishCycleEl.hidden = maia || !autoPlay || !stockfishAutoPlan;
+    stockfishCycleEl.hidden = maia || !stockfishAutoPlan ||
+      (stockfishAutoPlan.slot !== null && !autoPlay);
     panel.querySelector('#maia-web-maia-settings').hidden = !maia;
     panel.querySelector('#maia-web-maia-note').hidden = !maia;
     panel.querySelector('#maia-web-maia-settings label').textContent = study ? 'Human rating' : 'Maia rating';
     panel.querySelector('#maia-web-maia-note').textContent = study ?
       'Probability model · one pass; no search depth' : 'Maia 79M · one prediction pass; no search depth';
+    const fitted = stockfishElo < STOCKFISH_NATIVE_MIN_ELO;
+    depthEl.disabled = !maia && fitted;
+    depthEl.min = fitted ? String(LICHESS_FIT_DEPTH) : '10';
+    depthEl.value = String(fitted ? LICHESS_FIT_DEPTH : depth);
+    depthLabelEl.textContent = String(fitted ? LICHESS_FIT_DEPTH : depth);
+    panel.querySelector('#maia-web-stockfish-elo-row label').textContent = fitted
+      ? 'Lichess rating' : 'Target Elo';
     panel.querySelector('#maia-web-stockfish-strength').textContent = stockfishElo < STOCKFISH_NATIVE_MIN_ELO
-      ? `Below native ${STOCKFISH_NATIVE_MIN_ELO}: experimental cycle strength; no calibrated ${stockfishElo} Elo`
+      ? 'Lichess 5+0 sample · Stockfish 19 depth 6 · experimental, not Chess.com Elo'
       : `Native UCI_Elo ${stockfishElo} · six-move cycle overrides some choices`;
     panel.querySelector('#maia-web-retry').textContent = maia ? (study ? 'Load model' : 'Load Maia') : 'Retry analysis';
     publishStreamState();
